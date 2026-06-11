@@ -1,0 +1,139 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+bin/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+notebooks/runs/
+
+# PyTorch & ML
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Project outputs
+outputs/
+checkpoints/
+
+# Private keys
+wandb_api_key.yaml
+
+# Data directories (large datasets)
+data/
+
+# Instantaneous channel files (too large)
+**/wra_h_instantaneous.npz
+
+# Generated figures
+figures/
+
+# Internal tooling
+.claude/
+skills/
+.github/skills/
+
+# Internal documentation
+docs/
+summaries/
+
+# Test visualization outputs
+tests/figs/
+tests/models/plot_*/
+tests/tasks/**/stock_forecast*.pdf
+tests/tasks/**/viz_*.pdf
+
+# Logs
+*.log
+*.pot
+logs/
+
+# LaTeX auxiliary files
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~.nib
+
+# Sphinx documentation
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# Environment metadata
+.conda-env-info
+.python-version
+texput.log

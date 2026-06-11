@@ -1,0 +1,21 @@
+# @package dataset
+defaults:
+  - wra
+  - _self_
+
+name: wra
+scenario: medium_outdoor_high_density
+# datasets: ["wrpc_v1_primal_history_k200_h9a935502f8f0"]
+# datasets: ["medium_outdoor_high_density/wrpc_v1_primal_history_k200_h9a935502f8f0"]
+datasets: ["medium_outdoor_high_density/wrpc_v1_primal_history_k200_h9f72414094d4"]
+
+model_cond_channels: 3  # r_min appended as third node feature
+
+batch_size: 960
+batch_size_val: 800
+
+# 5:1:2 split: each sub-dataset independently splits by network ID
+train_fraction: 0.625  # First 5/8 of networks in each sub-dataset
+val_fraction: 0.125    # Next 1/8th
+test_fraction: 0.25    # Last 1/4th
+

@@ -1,0 +1,8 @@
+# @package diffusion
+defaults:
+  - energy_ddpm
+  - _self_
+
+name: energy_ddpm_wra
+clip_denoised: true
+dataset_root: ${hydra:runtime.cwd}/data/wra

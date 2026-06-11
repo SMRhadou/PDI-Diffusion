@@ -1,0 +1,48 @@
+# @package diffusion
+name: energy_ddpm
+_target_: pdi.diffusion.energy_ddpm.EnergyDDPM
+
+# Forward process schedule (inherited from DDPM).
+num_timesteps: 500
+beta_schedule: cosine
+beta_start: 0.0001
+beta_end: 0.02
+loss_type: l2
+parameterization: eps
+clip_denoised: true
+cosine_s: 0.008
+sigmoid_range: 6.0           # controls sigmoid schedule sharpness (only used when beta_schedule=sigmoid)
+compile_model: false
+
+# Energy-based score estimator hyperparameters.
+energy_mc_samples: 8
+energy_num_channel_realizations: 200
+inverse_beta: 0.1
+inverse_beta_schedule: linear   # constant | linear | cosine
+inverse_beta_start: null          # value at t=0 (clean end) when schedule is non-constant
+inverse_beta_end: null            # value at t=T-1 (noisiest end) when schedule is non-constant
+dual_update_mode: x0_pred   # x0_pred | full_backward | hybrid | langevin
+dual_step_size: 0.7
+dual_step_size_schedule: constant   # constant | linear | cosine
+dual_step_size_start: null         # value at t=0 (clean end) when schedule is non-constant
+dual_step_size_end: null            # value at t=T-1 (noisy end) when schedule is non-constant
+dual_num_outer_iterations: 15
+dual_lambda_init: 80.0
+dual_lambda_max: null
+langevin_step_size: 1.0e-4
+langevin_noise_scale: 1.0
+dataset_root: ${hydra:runtime.cwd}/data/wra
+# Fallback values only used in sparse-graph fallback mode.
+# In precomputed-channel mode, P_max/noise_var come from processed/metadata.json.
+# r_min can be forced globally via r_min_override.
+default_p_max: 1.0
+default_noise_var: 1.0e-12
+default_r_min: 0.5
+r_min_override: null
+min_energy_sigma: 1.0e-4
+use_precomputed_channels: true  # precomputed H_instantaneous slots per network
+allow_sparse_graph_fallback: false
+
+# Evaluation / inference parameters (not used during training).
+eval_n_samples_per_input: 50   # pool size K: independent samples drawn per network
+eval_ergodic_window: 100        # sliding window W (time steps) for ergodic rate evolution

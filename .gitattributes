@@ -1,0 +1,9 @@
+# Linguist language detection
+*.yaml linguist-language=YAML
+
+# Binary files - mark as binary but don't use LFS
+# (all large data files are excluded via .gitignore)
+*.pdf binary
+*.png binary
+*.npy binary
+*.npz binary
