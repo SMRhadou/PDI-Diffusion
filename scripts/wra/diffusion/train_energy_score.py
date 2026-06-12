@@ -156,7 +156,7 @@ def _parse_config_from_train_log(train_log_path):
                     break
                 else:
                     cfg_lines.append(line.rstrip())
-    return OmegaConf.create("\n".join(cfg_lines))
+    return OmegaConf.create("\n".join(cfg_lines).replace("graph_signal_diffusion.", "pdi."))
 
 
 def _build_portfolio_backbone(num_nodes, device, model_cond_channels=3,

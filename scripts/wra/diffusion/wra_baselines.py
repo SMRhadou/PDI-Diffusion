@@ -1556,7 +1556,7 @@ def _build_vanilla_ddim(checkpoint_dir, device, checkpoint_epoch=None):
                     break
                 else:
                     cfg_lines.append(line.rstrip())
-    cfg = OmegaConf.create("\n".join(cfg_lines))
+    cfg = OmegaConf.create("\n".join(cfg_lines).replace("graph_signal_diffusion.", "pdi."))
 
     model = instantiate(cfg.model)
     diff_dict = OmegaConf.to_container(cfg.diffusion, resolve=True)
