@@ -1,0 +1,34 @@
+# @package task
+defaults:
+  - /dataset: wra_debug # default dataset for this task
+  - /model: ugnn_wra
+  - /diffusion: ddim_wra
+  - /trainer: trainer_wra_debug
+  - _self_
+  
+name: wireless_resource_allocation
+_target_: pdi.tasks.wireless_resource_allocation.evaluator.WirelessResourceAllocationTask
+
+# Valid datasets for this task
+valid_datasets: [wra]
+
+# Evaluation parameters
+num_channel_realizations: 500  # Number of precomputed H_instantaneous slots required for rate evaluation
+ergodic_window_size: 5  # T_0
+num_eval_batches: 10  # Statistical robustness
+eval_h_chunk_size: 50  # Number of timesteps transferred per GPU chunk during slot evaluation
+eval_h_cache_budget_gb: 2.0  # Max memory (GB) for in-memory H pool cache (LRU eviction beyond this)
+h_io_mode: auto  # auto|legacy: use mmap sidecar when available, fallback to legacy per-timeslot files
+h_sidecar_filename: H_instantaneous_tmn.npy  # Contiguous (T,m,n) sidecar filename inside H_instantaneous/
+
+
+# Plotting behavior 
+plot_style:
+  plots:
+    task_power_scatter:
+      max_networks_per_dataset: 1
+
+    task_rate_evolution:
+      max_networks_per_dataset: 1
+
+    

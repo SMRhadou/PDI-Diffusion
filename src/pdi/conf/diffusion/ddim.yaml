@@ -1,0 +1,20 @@
+# @package diffusion
+name: ddim
+_target_: pdi.diffusion.ddim.DDIM
+
+# Noise schedule (training)
+num_timesteps: 500 # 1000
+beta_schedule: linear  # or 'cosine'
+beta_start: 0.0001
+beta_end: 0.02
+
+# Loss
+loss_type: l2  # or 'l1', 'huber'
+parameterization: eps  # or 'x0', 'v'
+
+# Sampling
+clip_denoised: false
+
+# DDIM-specific parameters
+sampling_timesteps: 100  # Number of sampling steps (accelerated). Set to null or num_timesteps for no acceleration
+ddim_eta: 0.2  # Stochasticity: 0.0 = deterministic (fastest), 1.0 = DDPM-like
