@@ -36,7 +36,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Requires Python 3.9+, PyTorch 2.5+, and PyTorch Geometric 2.5+. See [INSTALL.md](INSTALL.md) for GPU/CUDA setup.
+Requires Python 3.9+, PyTorch 2.5+, and PyTorch Geometric 2.5+. 
 
 ## Usage
 
@@ -48,7 +48,7 @@ micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score.py \
   --backbone portfolio_gnn \
   --hidden 256 --num-layers 8 --gnn-K 2 \
   --inverse-beta 1.0  --energy-mc-samples 8 --num-channel-realizations 50 \
-  --num-outer 1000  --inner-steps 10 --inner-steps-max 30 \
+  --num-outer 400  --inner-steps 10 --inner-steps-max 30 \
   --lr 0.001 --lr-min 1e-05 --batch-size 4 --minibatch-size 128  \
   --dual-step-size 0.05 --dual-lambda-init 10.0 --dual-lambda-max 50.0 \
   --dual-num-channel-realizations 500 \
@@ -61,7 +61,7 @@ micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score.py \
   --prior-mu-min 2.0 --prior-mu-max 10.0 \
   --eval-every 50 --eval-samples 200 --eval-networks 32 --eval-timeslots 500 \
   --seed 42 \
-  --label energy_portgnn_normal
+  --label pdi-net
 ```
 
 ### WRA: Train with outer-loop dual updates (DT)
@@ -71,7 +71,7 @@ micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score_dual.py 
     --dataset wra_medium_outdoor_high_density \
     --hidden 256 --num-layers 8 --gnn-K 2 \
     --inverse-beta 1.0 --energy-mc-samples 8 --num-channel-realizations 50 \
-    --num-outer 400 --inner-steps 30 --num-rollouts-per-outer 1 \
+    --num-outer 4000 --inner-steps 30 --num-rollouts-per-outer 1 \
     --lr 0.001 --lr-min 1e-05 \
     --batch-size 32 --n-samples-per-network 20 \
     --train-mc-samples 8 --target-clip-norm 20.0 \
@@ -81,13 +81,39 @@ micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score_dual.py 
     --lambda-update-chunk 32 \
     --eval-every 20 --eval-samples 20 --eval-networks 32 --eval-timeslots 50 \
     --seed 42 \
-    --label dual_update_lower_lr
+    --label dual_training
 ```
 
 ### WRA: Evaluate baselines and methods
 
 ```bash
-
+micromamba run -n gdiff python scripts/wra/diffusion/wra_baselines.py \
+    --methods pdi,pdl,pdm,dps \
+    --dataset wra_medium_outdoor_high_density \
+    --pdi-net-checkpoints <your_path> \
+    --dt-checkpoints <your_path> \
+    --pdi-net-hidden 256 \
+    --pdi-net-layers 8 \
+    --pdi-net-K 2 \
+    --inverse-beta 1.0 \
+    --dual-step-size 0.05 \
+    --dual-lambda-init 10.0 \
+    --energy-mc-samples 8 \
+    --num-channel-realizations 50 \
+    --n-samples-per-input 200 \
+    --max-batches 64 \
+    --sub-batch 20 \
+    --chunk-size 50 \
+    --eval-timeslots 500 \
+	--pdl-num-iters 500 \
+	--pdl-primal-lr 1e-4 \
+	--pdl-dual-lr 1.0 \
+	--pdl-lambda-init 0.0 \
+    --num-evolution-trials 50 \
+    --dual-lambda-decay 0.0 \
+    --pdm-iters 100 \
+    --pdm-rho 10.0 \
+    --label pdi_net_baselines
 ```
 
 ## Citation
@@ -95,8 +121,8 @@ micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score_dual.py 
 ```bibtex
 @software{pdi_diffusion_2026,
   title={Constrained Diffusion Models with Primal-Dual Inference},
-  author={Samar Hadou, Yigit Berkay Uslu, Alejandro Ribeiro},
+  author={Samar Hadou, Yigit Berkay Uslu, and Alejandro Ribeiro},
   year={2026},
-  url={}
+  url={https://arxiv.org/pdf/2606.17192}
 }
 ```

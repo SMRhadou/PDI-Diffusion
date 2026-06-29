@@ -1,4 +1,4 @@
-# Core dependencies for graph-signal-diffusion
+# Core dependencies for pdi
 # Python version: 3.11
 # PyTorch: 2.8.0, CUDA: 12.8
 #

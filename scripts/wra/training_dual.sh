@@ -1,0 +1,14 @@
+micromamba run -n gdiff python scripts/wra/diffusion/train_energy_score_dual.py \
+    --dataset wra_medium_outdoor_high_density \
+    --hidden 256 --num-layers 8 --gnn-K 2 \
+    --inverse-beta 1.0 --energy-mc-samples 8 --num-channel-realizations 50 \
+    --num-outer 4000 --inner-steps 10 \
+    --lr 0.001 --lr-min 1e-05 \
+    --batch-size 4 --n-samples-per-network 50 \
+    --lambda-batch-size 16 \
+    --train-mc-samples 8 --target-clip-norm 20.0 \
+    --buffer-capacity 4096 --grad-clip-norm 1.0 \
+    --perturb-fraction 0.5 --perturb-x-std 0.1 \
+    --dual-lr 0.1 --lambda-init 10.0 --lambda-max 50.0 \
+    --eval-every 50 --eval-samples 200 --eval-networks 32 --eval-timeslots 500 \
+    --label dual_update_per_batch_fast_lam10

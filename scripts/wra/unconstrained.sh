@@ -1,0 +1,25 @@
+micromamba run -n gdiff python scripts/wra/diffusion/wra_baselines.py \
+    --methods none \
+    --dataset wra_medium_outdoor_high_density \
+    --pdi-net-checkpoints \
+        "outputs/wireless_resource_allocation-wra/score_net_train/2026-06-01_23-20-14 - energy_portgnn_normal/checkpoints/outer_00400.pt" \
+    --pdi-net-hidden 256 \
+    --pdi-net-layers 8 \
+    --pdi-net-K 2 \
+    --inverse-beta 1.0 \
+    --dual-step-size 1e-10 \
+    --dual-lambda-init 0.0 \
+    --energy-mc-samples 8 \
+    --num-channel-realizations 50 \
+    --n-samples-per-input 200 \
+    --max-batches 64 \
+    --sub-batch 20 \
+    --chunk-size 50 \
+    --eval-timeslots 500 \
+	--pdl-num-iters 500 \
+	--pdl-primal-lr 1e-4 \
+	--pdl-dual-lr 1.0 \
+	--pdl-lambda-init 0.0 \
+    --num-evolution-trials 50 \
+    --dual-lambda-decay 0.0 \
+    --label pdi_net_unconstrained_K200

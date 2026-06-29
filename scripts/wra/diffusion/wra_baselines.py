@@ -220,11 +220,9 @@ def pdl_wra(
 # ---------------------------------------------------------------------------
 
 def _project_wra(x, context, num_iters=5, lr=0.05, rho=10.0):
-    """Project onto feasible set: min ||w - x||^2 s.t. ergodic_rate >= r_min."""
+    """Project onto feasible set: min_w ||w - x||^2 + (rho/2)||[f(w)]_+||^2."""
     x0 = x.clone().detach()
     w = x0.clone()
-    B, T_seq, N, F = x.shape
-    lam = torch.zeros(B, N, device=x.device, dtype=x.dtype)
     r_min = context.r_min.view(-1, 1)
 
     for _ in range(num_iters):
@@ -232,18 +230,13 @@ def _project_wra(x, context, num_iters=5, lr=0.05, rho=10.0):
         erg, _ = _ergodic_rates(w_req, context)
         violation = (r_min - erg).clamp_min(0.0)
         proximity = ((w_req - x0) ** 2).sum()
-        penalty = (lam * violation).sum() + (rho / 2.0) * (violation ** 2).sum()
+        penalty = (rho / 2.0) * (violation ** 2).sum()
         loss = proximity + penalty
         if violation.max().item() < 1e-6:
             break
         grad = torch.autograd.grad(loss, w_req)[0]
         w = (w_req - lr * grad).detach()
         w = w.clamp(-0.5, 0.5)
-
-        with torch.no_grad():
-            erg_now, _ = _ergodic_rates(w, context)
-            v = (r_min - erg_now).clamp_min(0.0)
-            lam = lam + rho * v
 
     return w.detach()
 
@@ -254,9 +247,8 @@ def _final_project_wra(x, sampler, dataset_name, network_id, num_nodes,
                         max_timeslots=None):
     """Project onto the feasible set using full channel history.
 
-    Solves: min ||w - w_0||^2  s.t. ergodic_rate_j(w) >= r_min for all j
-    via augmented Lagrangian: L = ||w - w_0||^2 + λ·v + (ρ/2)||v_+||^2
-    where v_+ = max(0, r_min - ergodic_rate).
+    Solves: min_w ||w - w_0||^2 + (rho/2)||[f(w)]_+||^2
+    where [f(w)]_+ = max(0, r_min - ergodic_rate).
 
     Uses the same rate formula as _compute_full_ergodic_evolution so that
     feasibility measured here matches evaluation.
@@ -282,28 +274,19 @@ def _final_project_wra(x, sampler, dataset_name, network_id, num_nodes,
 
     w0 = x[:, 0, :, 0].clone().detach()
     w = w0.clone()
-    lam = torch.zeros(B, N, device=device, dtype=x.dtype)
-    current_rho = rho
 
     for it in range(num_iters):
         w_req = w.detach().requires_grad_(True)
         erg = _erg_rates(w_req)
         violation = (r_min - erg).clamp_min(0.0)
         proximity = ((w_req - w0) ** 2).sum(dim=1)
-        penalty = (lam * violation).sum(dim=1) + (current_rho / 2.0) * (violation ** 2).sum(dim=1)
+        penalty = (rho / 2.0) * (violation ** 2).sum(dim=1)
         loss = (proximity + penalty).mean()
         if violation.max().item() < 1e-6:
             break
         grad = torch.autograd.grad(loss, w_req)[0]
         w = (w_req - lr * grad).detach()
         w = w.clamp(-0.5, 0.5)
-
-        with torch.no_grad():
-            erg_now = _erg_rates(w)
-            v = (r_min - erg_now).clamp_min(0.0)
-            lam = lam + current_rho * v
-            if it % 50 == 49:
-                current_rho *= 2.0
 
     result = x.clone()
     result[:, 0, :, 0] = w
@@ -319,6 +302,7 @@ def pdm_wra(
     *,
     projection_iters: int = 5,
     projection_lr: float = 0.05,
+    projection_rho: float = 10.0,
     seed: int = 42,
     show_progress: bool = True,
 ) -> Tuple[torch.Tensor, Dict]:
@@ -347,9 +331,8 @@ def pdm_wra(
                 x0_pred, eps_pred = sampler._pred_to_x0_eps(x_t, t, pred)
                 x_t = sampler._ddim_step(x_t=x_t, t=t, t_next=t_next,
                                          x0_pred=x0_pred, eps_pred=eps_pred, eta=sampler.ddim_eta)
-            x_t = _project_wra(x_t, context, num_iters=projection_iters, lr=projection_lr)
+            x_t = _project_wra(x_t, context, num_iters=projection_iters, lr=projection_lr, rho=projection_rho)
     else:
-        dual_lambda = torch.zeros(B, N, device=device)
         iterator = reversed(range(sampler.num_timesteps))
         if show_progress:
             iterator = tqdm.tqdm(iterator, desc="PDM Sampling", unit="step")
@@ -357,7 +340,7 @@ def pdm_wra(
             t = torch.full((B,), t_int, device=device, dtype=torch.long)
             with torch.no_grad():
                 score = sampler._estimate_score(
-                    x_t=x_t, t=t, context=context, dual_lambda=dual_lambda)
+                    x_t=x_t, t=t, context=context)
                 x0_pred, eps_pred = sampler._score_to_x0_eps(x_t=x_t, t=t, score=score)
                 mean = sampler._posterior_mean(x0_pred=x0_pred, x_t=x_t, t=t)
                 if t_int > 0:
@@ -365,7 +348,7 @@ def pdm_wra(
                     x_t = mean + torch.sqrt(var) * torch.randn_like(x_t)
                 else:
                     x_t = mean
-            x_t = _project_wra(x_t, context, num_iters=projection_iters, lr=projection_lr)
+            x_t = _project_wra(x_t, context, num_iters=projection_iters, lr=projection_lr, rho=projection_rho)
 
     return x_t.detach(), {"projection_iters": projection_iters}
 
@@ -404,7 +387,8 @@ def dps_wra(
         violation = (_r_min.view(-1, 1) - erg).clamp_min(0.0)
         loss = (violation ** 2).sum()
         grad_xt = torch.autograd.grad(loss, x_t_g)[0]
-        return (x_t - dps_scale * grad_xt).detach()
+        sigma_t = torch.sqrt((1.0 - alpha_bar).clamp_min(1e-12))
+        return (x_t - dps_scale * sigma_t * grad_xt).detach()
 
     if is_ddim:
         B, N = shape[0], shape[2]
@@ -1689,13 +1673,12 @@ def main():
     parser.add_argument("--pdl-lambda-init", type=float, default=0.0)
 
     # PDM hyperparams
-    parser.add_argument("--pdm-projection-iters", type=int, default=5)
-    parser.add_argument("--pdm-projection-lr", type=float, default=0.05)
-    parser.add_argument("--pdm-final-iters", type=int, default=500,
-                        help="Augmented Lagrangian iterations for final projection on full channel history (0 to disable)")
-    parser.add_argument("--pdm-final-lr", type=float, default=0.05)
-    parser.add_argument("--pdm-final-rho", type=float, default=10.0,
-                        help="Penalty weight for augmented Lagrangian")
+    parser.add_argument("--pdm-iters", type=int, default=100,
+                        help="Gradient steps per projection (both per-step and final)")
+    parser.add_argument("--pdm-lr", type=float, default=0.05,
+                        help="Step size for projection")
+    parser.add_argument("--pdm-rho", type=float, default=10.0,
+                        help="Penalty weight rho")
 
     # DPS hyperparams
     parser.add_argument("--dps-scale", type=float, default=1.0)
@@ -2157,21 +2140,21 @@ def main():
             pdm_sampler = _net_patched_sampler or sampler_unc
             x_pdm, diag = pdm_wra(
                 pdm_sampler, shape, device, batch, context,
-                projection_iters=args.pdm_projection_iters,
-                projection_lr=args.pdm_projection_lr,
+                projection_iters=args.pdm_iters,
+                projection_lr=args.pdm_lr,
+                projection_rho=args.pdm_rho,
                 seed=args.seed + batch_idx,
             )
-            if args.pdm_final_iters > 0:
-                x_pdm = _final_project_wra(
-                    x_pdm, any_sampler, ds_name, net_id, N, device,
-                    p_max=float(context.p_max[0, 0, 0]),
-                    noise_var=float(context.noise_var[0, 0, 0]),
-                    r_min=float(context.r_min[0]),
-                    num_iters=args.pdm_final_iters,
-                    lr=args.pdm_final_lr,
-                    rho=args.pdm_final_rho,
-                    max_timeslots=args.eval_timeslots,
-                )
+            x_pdm = _final_project_wra(
+                x_pdm, any_sampler, ds_name, net_id, N, device,
+                p_max=float(context.p_max[0, 0, 0]),
+                noise_var=float(context.noise_var[0, 0, 0]),
+                r_min=float(context.r_min[0]),
+                num_iters=args.pdm_iters,
+                lr=args.pdm_lr,
+                rho=args.pdm_rho,
+                max_timeslots=args.eval_timeslots,
+            )
             dt = time.time() - t0
             m = _evaluate_method(
                 x_pdm, context, any_sampler, ds_name, net_id, N,
