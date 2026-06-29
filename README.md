@@ -12,11 +12,11 @@ Code for [constrained diffusion models using primal-dual inference](https://arxi
 
 ```
 src/pdi/
-    cli/                # Entry points (train, WRA channel analysis, PD expert, dataset building)
-    diffusion/          # DDPM, DDIM, energy-guided diffusion
+    cli/                # Entry points for wra (train, PD expert, dataset building)
+    diffusion/          # DDPM, DDIM, dual-variable-conditioned diffusion
     models/             # Architectures (GNN, MLP, UGNN)
     trainers/
-        energy_score/   # Energy-guided score training with dual variables
+        energy_score/   # Score training for dual-variable-conditioned models
     tasks/              # Task definitions and evaluators (WRA, portfolio)
     datasets/wra/       # Wireless channel data loading and PD sample management
     conf/               # Hydra configs (dataset, model, diffusion, trainer, wra_generation)
@@ -31,13 +31,31 @@ scripts/
 ## Installation
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
-```
+# 1. Install micromamba
+"${SHELL}" <(curl -L micro.mamba.pm/install.sh)
 
-Requires Python 3.9+, PyTorch 2.5+, and PyTorch Geometric 2.5+. 
+# 2. Create env
+micromamba create -n gdiff python=3.11 -c conda-forge -y
+
+# 3. Install PyTorch (adjust cu128 to match your CUDA: cu124, cu121, etc.)
+micromamba run -n gdiff pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# 4. Install PyG + extensions
+micromamba run -n gdiff pip install torch-geometric
+micromamba run -n gdiff pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
+  -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+
+# 5. Install project dependencies
+micromamba run -n gdiff pip install -r requirements.txt
+
+# 6. Install project in editable mode
+micromamba run -n gdiff pip install -e .
+
+# 7. Verify
+micromamba run -n gdiff python -c "import torch; import torch_geometric; \
+  print(f'torch={torch.__version__}, cuda={torch.version.cuda}'); print('OK')"
+```
 
 ## Usage
 
