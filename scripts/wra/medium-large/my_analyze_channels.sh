@@ -13,6 +13,8 @@
 #   bash scripts/wra/medium-large/sophisticated-oarfish-9/1_analyze_channels.sh 8
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export HYDRA_FULL_ERROR=1
 
 GPU_ID="${GPU_ID:-0}"

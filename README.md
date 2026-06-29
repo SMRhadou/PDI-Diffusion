@@ -49,10 +49,7 @@ micromamba run -n gdiff pip install torch-scatter torch-sparse torch-cluster tor
 # 5. Install project dependencies
 micromamba run -n gdiff pip install -r requirements.txt
 
-# 6. Install project in editable mode
-micromamba run -n gdiff pip install -e .
-
-# 7. Verify
+# 6. Verify
 micromamba run -n gdiff python -c "import torch; import torch_geometric; \
   print(f'torch={torch.__version__}, cuda={torch.version.cuda}'); print('OK')"
 ```

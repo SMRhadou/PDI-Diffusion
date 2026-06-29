@@ -15,6 +15,8 @@
 #   bash scripts/wra/medium-large/sophisticated-oarfish-9/3_build_dataset.sh
 
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export HYDRA_FULL_ERROR=1
 
 LINK_HELPER=scripts/wra/link_h_instantaneous_ref.sh

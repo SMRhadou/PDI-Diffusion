@@ -4,6 +4,8 @@
 #
 # r_min=0.6 is built first as the H_instantaneous reference; the others symlink to it.
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export HYDRA_FULL_ERROR=1
 
 SCENARIO_ROOT=data/wra/medium_outdoor_high_density

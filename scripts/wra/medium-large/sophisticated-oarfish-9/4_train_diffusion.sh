@@ -23,6 +23,8 @@
 
 export LD_LIBRARY_PATH="${HOME}/miniconda3/envs/graph-signal-diffusion/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export HYDRA_FULL_ERROR=1
 
 GPU_ID="${GPU_ID:-0}"
