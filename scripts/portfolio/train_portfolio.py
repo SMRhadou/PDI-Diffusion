@@ -187,7 +187,8 @@ def main():
     p.add_argument("--no-normalize", action="store_true", default=False)
     p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--buffer-cap", type=int, default=8192)
-    p.add_argument("--eval-every", type=int, default=50)
+    p.add_argument("--eval-every", type=int, default=20,
+                   help="Evaluate every N outer iterations")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--label", type=str, required=True)
     p.add_argument("--target-clip-norm", type=float, default=20.0)
@@ -215,13 +216,6 @@ def main():
                         stream=sys.stdout)
     log = logging.getLogger("train_portfolio")
 
-    print("=" * 60)
-    print("TRAIN PORTFOLIO — full parameter dump")
-    print("=" * 60)
-    for k, v in sorted(vars(args).items()):
-        print(f"  {k}: {v}")
-    print("=" * 60)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
@@ -241,8 +235,17 @@ def main():
         "score_net_train",
         f"{args.size}_ib{args.ib:g}_ds{args.dual_step:g}_mumax{args.mu_max:g}_rho{args.rho_max:g}_{args.label}",
     )
+
+    # File logging + args dump (like WRA)
+    fh = logging.FileHandler(out_dir / "train.log")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(fh)
+
     log.info("output dir: %s", out_dir)
     log.info("config: %s", vars(args))
+    with open(out_dir / "args.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
 
     # Score net
     if args.backbone == "gnn":
@@ -642,6 +645,7 @@ def main():
     best_vio = {"vio": float("inf"), "iter": -1, "state": None, "metrics": None}
 
     history = []
+    eval_history = []
 
     def _hook(info):
         history.append(info)
@@ -651,37 +655,42 @@ def main():
                      info.get("pred_rms_ratio_mean", 0), info.get("t_mean", 0),
                      info.get("rho", 0))
 
-        if info["iter"] > 0 and info["iter"] % args.eval_every == 0:
-            metrics = _eval_on_val(score_net)
-            log.info("[eval iter=%d] val(%d) ret=%.4f±%.4f sharpe=%.3f±%.3f "
-                     "csat=%.3f±%.3f O2max=%.6f vio_mean=%.2e Neff=%.1f |top1|=%.0f",
-                     info["iter"], len(val_instances),
-                     metrics["ret"], metrics["ret_std"],
-                     metrics["sharpe"], metrics["sharpe_std"],
-                     metrics["opt2_csat"], metrics["opt2_csat_std"],
-                     metrics["opt2_max_vio"], metrics["vio_mean"],
-                     metrics["neff"], metrics["n_top1"])
+    def _eval_and_checkpoint(outer_idx, sgd_count):
+        metrics = _eval_on_val(score_net)
+        metrics["outer"] = outer_idx
+        metrics["sgd_iter"] = sgd_count
+        eval_history.append(metrics)
+        with open(out_dir / "eval_history.jsonl", "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+        log.info("[eval outer=%d sgd=%d] val(%d) ret=%.4f±%.4f sharpe=%.3f±%.3f "
+                 "csat=%.3f±%.3f O2max=%.6f vio_mean=%.2e Neff=%.1f |top1|=%.0f",
+                 outer_idx, sgd_count, len(val_instances),
+                 metrics["ret"], metrics["ret_std"],
+                 metrics["sharpe"], metrics["sharpe_std"],
+                 metrics["opt2_csat"], metrics["opt2_csat_std"],
+                 metrics["opt2_max_vio"], metrics["vio_mean"],
+                 metrics["neff"], metrics["n_top1"])
 
-            _sd = {k: v.detach().cpu().clone() for k, v in score_net.state_dict().items()}
-            if metrics["sharpe"] > best_sharpe["sharpe"]:
-                best_sharpe.update(sharpe=metrics["sharpe"], iter=info["iter"],
-                                   state=_sd, metrics=metrics.copy())
-                torch.save(_sd, out_dir / "score_net_best_sharpe.pt")
-            if metrics["opt2_csat"] > best_feas["feas_relaxed"]:
-                best_feas.update(feas_relaxed=metrics["opt2_csat"], iter=info["iter"],
-                                 state=_sd, metrics=metrics.copy())
-                torch.save(_sd, out_dir / "score_net_best_feas.pt")
-            pareto_score = metrics["opt2_csat"] + 0.1 * metrics["sharpe"]
-            if pareto_score > best_pareto["pareto"]:
-                best_pareto.update(pareto=pareto_score, iter=info["iter"],
-                                   state=_sd, metrics=metrics.copy())
-                torch.save(_sd, out_dir / "score_net_best_pareto.pt")
-            if metrics["opt2_max_vio"] < best_vio["vio"]:
-                best_vio.update(vio=metrics["opt2_max_vio"], iter=info["iter"],
-                                state=_sd, metrics=metrics.copy())
-                torch.save(_sd, out_dir / "score_net_best_vio.pt")
-            torch.save(_sd, out_dir / "score_net_last.pt")
-            score_net.train()  # ensure back to train mode
+        _sd = {k: v.detach().cpu().clone() for k, v in score_net.state_dict().items()}
+        if metrics["sharpe"] > best_sharpe["sharpe"]:
+            best_sharpe.update(sharpe=metrics["sharpe"], iter=sgd_count,
+                               state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_sharpe.pt")
+        if metrics["opt2_csat"] > best_feas["feas_relaxed"]:
+            best_feas.update(feas_relaxed=metrics["opt2_csat"], iter=sgd_count,
+                             state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_feas.pt")
+        pareto_score = metrics["opt2_csat"] + 0.1 * metrics["sharpe"]
+        if pareto_score > best_pareto["pareto"]:
+            best_pareto.update(pareto=pareto_score, iter=sgd_count,
+                               state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_pareto.pt")
+        if metrics["opt2_max_vio"] < best_vio["vio"]:
+            best_vio.update(vio=metrics["opt2_max_vio"], iter=sgd_count,
+                            state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_vio.pt")
+        torch.save(_sd, out_dir / "score_net_last.pt")
+        score_net.train()
 
     # Pre-generate all training instances
     _all_train_instances = []
@@ -826,6 +835,8 @@ def main():
             if scheduler:
                 scheduler.step()
             _sgd_count += 1
+        if (outer + 1) % args.eval_every == 0:
+            _eval_and_checkpoint(outer, _sgd_count)
     train_wall = time.time() - t0
     log.info("training done in %.1f s (%.1f min)", train_wall, train_wall / 60)
 
@@ -856,24 +867,26 @@ def main():
              pred_rms=np.array([h.get("pred_rms_ratio_mean", 0) for h in history]),
              t_mean=np.array([h.get("t_mean", 0) for h in history]),
              rho=np.array([h.get("rho", 0) for h in history]))
+    with open(out_dir / "train_history.json", "w") as f:
+        json.dump(history, f)
+    with open(out_dir / "eval_history.json", "w") as f:
+        json.dump(eval_history, f)
 
     log.info("=" * 70)
-    log.info("best_sharpe  (iter %d): sharpe=%.3f feas=%.3f/%.3f ret=%.4f var=%.5f",
+    log.info("best_sharpe  (iter %d): sharpe=%.3f csat=%.3f ret=%.4f",
              best_sharpe["iter"],
              best_sharpe["metrics"]["sharpe"] if best_sharpe["metrics"] else 0,
-             best_sharpe["metrics"]["feas_strict"] if best_sharpe["metrics"] else 0,
-             best_sharpe["metrics"]["feas_relaxed"] if best_sharpe["metrics"] else 0,
-             best_sharpe["metrics"]["expected_return"] if best_sharpe["metrics"] else 0,
-             best_sharpe["metrics"]["portfolio_var"] if best_sharpe["metrics"] else 0)
-    log.info("best_feas    (iter %d): feas_rel=%.3f sharpe=%.3f ret=%.4f",
+             best_sharpe["metrics"]["opt2_csat"] if best_sharpe["metrics"] else 0,
+             best_sharpe["metrics"]["ret"] if best_sharpe["metrics"] else 0)
+    log.info("best_feas    (iter %d): csat=%.3f sharpe=%.3f ret=%.4f",
              best_feas["iter"],
-             best_feas["metrics"]["feas_relaxed"] if best_feas["metrics"] else 0,
+             best_feas["metrics"]["opt2_csat"] if best_feas["metrics"] else 0,
              best_feas["metrics"]["sharpe"] if best_feas["metrics"] else 0,
-             best_feas["metrics"]["expected_return"] if best_feas["metrics"] else 0)
-    log.info("best_pareto  (iter %d): score=%.3f feas_rel=%.3f sharpe=%.3f",
+             best_feas["metrics"]["ret"] if best_feas["metrics"] else 0)
+    log.info("best_pareto  (iter %d): score=%.3f csat=%.3f sharpe=%.3f",
              best_pareto["iter"],
              best_pareto["pareto"] if best_pareto["pareto"] > -1 else 0,
-             best_pareto["metrics"]["feas_relaxed"] if best_pareto["metrics"] else 0,
+             best_pareto["metrics"]["opt2_csat"] if best_pareto["metrics"] else 0,
              best_pareto["metrics"]["sharpe"] if best_pareto["metrics"] else 0)
     log.info("output: %s", out_dir)
 
