@@ -14,10 +14,10 @@ Code for [constrained diffusion models using primal-dual inference](https://arxi
 src/pdi/
     cli/                # Entry points for wra (train, PD expert, dataset building)
     diffusion/          # DDPM, DDIM, dual-variable-conditioned diffusion
-    models/             # Architectures (GNN, MLP, UGNN)
+    models/             # Architectures
     trainers/
         energy_score/   # Score training for dual-variable-conditioned models
-    tasks/              # Task definitions and evaluators (WRA, portfolio)
+    tasks/              # Task definitions and evaluators 
     datasets/wra/       # Wireless channel data loading and PD sample management
     conf/               # Hydra configs (dataset, model, diffusion, trainer, wra_generation)
 
@@ -54,7 +54,7 @@ micromamba run -n gdiff python -c "import torch; import torch_geometric; \
   print(f'torch={torch.__version__}, cuda={torch.version.cuda}'); print('OK')"
 ```
 
-## Usage
+## WRA Usage
 
 ### WRA: Data generation with ST baseline (PD expert → dataset → ST)
 
@@ -88,6 +88,12 @@ bash scripts/wra/training_dual.sh
 
 ```bash
 bash scripts/wra/baselines.sh
+```
+
+## Portfolio Usage
+### Portfolio: Train dual-variable-conditioned score network for PDI implementation
+```bash
+bash scripts/portfolio/train.sh
 ```
 
 ## Citation

@@ -372,6 +372,119 @@ def main():
         return {"micro_batches": micro_batches}
     trainer._gather_minibatch = _patched_gather_minibatch
 
+    # Monkey-patch train_step: loop over micro-batches (one per instance),
+    # accumulate gradients, then do a single optimizer step.
+    _orig_train_step = trainer.train_step
+
+    def _patched_train_step() -> dict:
+        if trainer.buffer.num_records == 0:
+            raise RuntimeError("train_step called before any rollout populated the buffer.")
+
+        entries = trainer.buffer.sample(trainer.cfg.minibatch_size)
+        mb = trainer._gather_minibatch(entries)
+        micro_batches = mb["micro_batches"]
+        rho = trainer._current_rho()
+        alphas_cumprod = trainer.mc_sampler.alphas_cumprod
+
+        trainer.optimizer.zero_grad(set_to_none=True)
+
+        total_loss = 0.0
+        total_M = 0
+        all_cos = []
+        all_rms_ratio = []
+        all_t = []
+
+        for ub in micro_batches:
+            M = ub["x_t"].shape[0]
+            lam = trainer._resolve_lambda(ub, rho).detach()
+
+            if trainer.cfg.perturb_fraction > 0:
+                mask = torch.rand(M, device=trainer.device) < trainer.cfg.perturb_fraction
+                if mask.any():
+                    idx = mask.nonzero(as_tuple=True)[0]
+                    ub["x_t"][idx] += trainer.cfg.perturb_x_std * torch.randn_like(ub["x_t"][idx])
+                    lam[idx] = (lam[idx] * (1.0 + trainer.cfg.perturb_lambda_std * torch.randn_like(lam[idx]))).clamp_min(0.0)
+
+            with torch.no_grad():
+                context = trainer._build_micro_context(ub["data"])
+                mc_chunk = max(1, trainer.cfg.mc_score_chunk)
+                eps_parts = []
+                from dataclasses import fields as _dc_fields, replace as _dc_replace
+                ctx_fields = _dc_fields(context)
+                for c0 in range(0, M, mc_chunk):
+                    c1 = min(c0 + mc_chunk, M)
+                    ctx_updates = {}
+                    for f in ctx_fields:
+                        v = getattr(context, f.name)
+                        if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == M:
+                            ctx_updates[f.name] = v[c0:c1]
+                    ctx_chunk = _dc_replace(context, **ctx_updates) if ctx_updates else context
+                    mc_score_c = trainer.mc_sampler._estimate_score(
+                        x_t=ub["x_t"][c0:c1], t=ub["t"][c0:c1],
+                        context=ctx_chunk, dual_lambda=lam[c0:c1],
+                    )
+                    ab_c = alphas_cumprod[ub["t"][c0:c1]].view(-1, 1, 1, 1)
+                    sqrt_omb_c = torch.sqrt((1.0 - ab_c).clamp_min(1e-12))
+                    eps_c = -mc_score_c * sqrt_omb_c
+                    if trainer.cfg.target_clip_norm > 0:
+                        flat_c = eps_c.reshape(c1 - c0, -1)
+                        norms_c = flat_c.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                        scale_c = (trainer.cfg.target_clip_norm / norms_c).clamp_max(1.0)
+                        eps_c = (flat_c * scale_c).view_as(eps_c)
+                    eps_parts.append(eps_c)
+                eps_target = torch.cat(eps_parts, dim=0)
+
+            eps_pred = trainer.score_net(
+                x=ub["x_t"], timesteps=ub["t"], dual_lambda=lam,
+                edge_index=ub["edge_index"], edge_weight=ub["edge_weight"],
+                cond=ub["cond_full"], return_intermediates=False,
+            )
+
+            w = trainer._loss_weight(ub["t"]).view(-1, 1, 1, 1)
+            if trainer.cfg.target_normalize:
+                tgt_rms = eps_target.detach().reshape(M, -1).pow(2).mean(dim=1).clamp_min(
+                    float(trainer.cfg.target_normalize_eps) ** 2
+                ).sqrt().view(M, 1, 1, 1)
+                resid = (eps_pred - eps_target) / tgt_rms
+            else:
+                resid = eps_pred - eps_target
+            loss = (resid ** 2 * w).sum() / trainer.cfg.minibatch_size
+            loss.backward()
+
+            total_loss += float(loss.detach().item()) * M
+            total_M += M
+
+            with torch.no_grad():
+                p = eps_pred.detach().reshape(M, -1)
+                tgt = eps_target.detach().reshape(M, -1)
+                p_n = p / p.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                t_n = tgt / tgt.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                all_cos.append((p_n * t_n).sum(dim=1))
+                rms_floor = float(trainer.cfg.target_normalize_eps) if trainer.cfg.target_normalize else 1e-12
+                all_rms_ratio.append(p.pow(2).mean(dim=1).sqrt() / tgt.pow(2).mean(dim=1).sqrt().clamp_min(rms_floor))
+                all_t.append(ub["t"].float())
+
+        if trainer.cfg.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                trainer.score_net.parameters(), float(trainer.cfg.grad_clip_norm))
+        trainer.optimizer.step()
+        trainer._iteration += 1
+
+        cos_vals = torch.cat(all_cos)
+        rms_ratio = torch.cat(all_rms_ratio)
+        t_vals = torch.cat(all_t)
+        return {
+            "loss": total_loss / max(total_M, 1),
+            "rho": rho,
+            "iter": trainer._iteration,
+            "cos_mean": float(cos_vals.mean()),
+            "cos_median": float(cos_vals.median()),
+            "pred_rms_ratio_mean": float(rms_ratio.mean()),
+            "t_mean": float(t_vals.mean()),
+        }
+
+    trainer.train_step = _patched_train_step
+
     # Training loader: dummy PyG batches
     def _infinite_loader():
         class _L:
