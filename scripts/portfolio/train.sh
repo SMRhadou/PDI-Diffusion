@@ -1,0 +1,11 @@
+micromamba run -n gdiff python scripts/portfolio/train_portfolio.py \
+  --size crypto --ib 2000 --dual-step 300 --no-normalize \
+  --dual-lambda-decay 0.001 --dual-lambda-max 10000 \
+  --batch-size 128 --mc-samples-train 512 --hidden 128 --num-layers 6 \
+  --lr 3e-4 --mu-min 150 --mu-max 1500 --rho-max 0.7 \
+  --target-clip-norm 20.0 --perturb-fraction 0.5 --perturb-lambda-std 0.3 \
+  --minibatch-size 128 --tagconv-K 1 --beta-schedule cosine \
+  --backbone gnn --num-outer 600 --eval-every 50 --eval-B 64 \
+  --lam0 0.1 --num-rollouts-per-outer 4 --num-instances 200 \
+  --num-val-instances 10 \
+  --label v13_K1_cosine
