@@ -37,6 +37,7 @@ if _SRC not in sys.path:
 
 from pdi.diffusion.portfolio_energy_ddpm import (  # noqa: E402
     PortfolioEnergyDDPM, make_portfolio_problem,
+    variance_contributions_np,
 )
 
 
@@ -72,13 +73,19 @@ def run_and_record_lambda(ib: float, dual_step: float, mu, Sigma, scenarios, bud
                            dual_lambda_decay: float = 0.0,
                            lam0: float = 0.0,
                            constraint_type: str = "shortfall",
-                           num_sectors: int = 10) -> dict:
+                           num_sectors: int = 10,
+                           objective_scale: float = 1.0,
+                           constraint_scale: float = 1.0) -> dict:
     """Run the MC reverse pass and record lambda at every timestep."""
     torch.manual_seed(seed)
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        bud_scaled = budgets * constraint_scale
+    else:
+        bud_scaled = budgets
     sampler = PortfolioEnergyDDPM(
         model=_NoOp(), num_timesteps=T, beta_schedule=beta_schedule,
         portfolio_mu=mu, portfolio_Sigma=Sigma,
-        portfolio_scenarios=scenarios, portfolio_risk_budgets=budgets,
+        portfolio_scenarios=scenarios, portfolio_risk_budgets=bud_scaled,
         portfolio_alpha=alpha,
         energy_mc_samples=K,
         inverse_beta=ib, inverse_beta_schedule="constant",
@@ -92,6 +99,8 @@ def run_and_record_lambda(ib: float, dual_step: float, mu, Sigma, scenarios, bud
         normalize_constraints=normalize_constraints,
         constraint_type=constraint_type,
         num_sectors=num_sectors,
+        objective_scale=objective_scale,
+        constraint_scale=constraint_scale,
     ).to(device)
 
     data = _make_batch(B, N).to(device)
@@ -221,9 +230,20 @@ def main():
     mu, Sigma, scenarios, budgets, alpha = make_portfolio_problem(
         constraint_type=constraint_type, **pcfg)
 
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        _c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma).mean()
+        _ret_mean = abs(scenarios.mean(axis=0)).mean()
+        _obj_scale = 1.0 / max(_ret_mean, 1e-12)
+        _constraint_scale = 1.0 / max(_c_eq_mean, 1e-12)
+    else:
+        _obj_scale = 1.0
+        _constraint_scale = 1.0
+
     print(f"[calibrate] size={args.size} N={N} ib={args.ib} ds={args.dual_step} T={args.T} B={args.B}")
     print(f"  constraint_type={constraint_type} normalize={not args.no_normalize}")
     print(f"  budgets shape={budgets.shape} range=[{budgets.min():.4g}, {budgets.max():.4g}]")
+    if _constraint_scale != 1.0:
+        print(f"  O(1) scaling: obj_scale={_obj_scale:.4g} constraint_scale={_constraint_scale:.4g}")
     t0 = time.time()
     result = run_and_record_lambda(
         ib=args.ib, dual_step=args.dual_step,
@@ -237,6 +257,8 @@ def main():
         lam0=args.lam0,
         constraint_type=constraint_type,
         num_sectors=pcfg.get("num_sectors", 10),
+        objective_scale=_obj_scale,
+        constraint_scale=_constraint_scale,
     )
     wall = time.time() - t0
 

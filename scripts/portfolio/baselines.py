@@ -62,7 +62,8 @@ def markowitz_unconstrained(mu: np.ndarray, Sigma: np.ndarray,
 
 
 def markowitz_constrained(mu: np.ndarray, Sigma: np.ndarray, budgets: np.ndarray,
-                           risk_aversion: float = 5.0) -> np.ndarray:
+                           risk_aversion: float = 5.0,
+                           constraint_type: str = "variance") -> np.ndarray:
     """Long-only mean-variance with per-asset risk budgets via SLSQP."""
     from scipy.optimize import minimize
     N = len(mu)
@@ -73,20 +74,44 @@ def markowitz_constrained(mu: np.ndarray, Sigma: np.ndarray, budgets: np.ndarray
     def obj_grad(x):
         return risk_aversion * Sigma @ x - mu
 
-    def ineq(x):
-        return budgets - x * (Sigma @ x)
+    constraints = [
+        {"type": "eq", "fun": lambda x: x.sum() - 1.0, "jac": lambda x: np.ones(N)},
+    ]
 
-    def ineq_jac(x):
-        Sx = Sigma @ x
-        return -np.diag(Sx) - np.diag(x) @ Sigma
+    if constraint_type == "variance_band":
+        bud_upper = budgets[:N]
+        bud_lower = -budgets[N:]
 
-    eq = {"type": "eq", "fun": lambda x: x.sum() - 1.0, "jac": lambda x: np.ones(N)}
-    ineq_c = {"type": "ineq", "fun": ineq, "jac": ineq_jac}
+        def ineq_upper(x):
+            return bud_upper - x * (Sigma @ x)
+
+        def ineq_upper_jac(x):
+            Sx = Sigma @ x
+            return -np.diag(Sx) - np.diag(x) @ Sigma
+
+        def ineq_lower(x):
+            return x * (Sigma @ x) - bud_lower
+
+        def ineq_lower_jac(x):
+            Sx = Sigma @ x
+            return np.diag(Sx) + np.diag(x) @ Sigma
+
+        constraints.append({"type": "ineq", "fun": ineq_upper, "jac": ineq_upper_jac})
+        constraints.append({"type": "ineq", "fun": ineq_lower, "jac": ineq_lower_jac})
+    else:
+        def ineq(x):
+            return budgets - x * (Sigma @ x)
+
+        def ineq_jac(x):
+            Sx = Sigma @ x
+            return -np.diag(Sx) - np.diag(x) @ Sigma
+
+        constraints.append({"type": "ineq", "fun": ineq, "jac": ineq_jac})
+
     bounds = [(0.0, 1.0)] * N
-
     x0 = np.ones(N) / N
     res = minimize(obj, x0, jac=obj_grad, method="SLSQP",
-                   bounds=bounds, constraints=[eq, ineq_c],
+                   bounds=bounds, constraints=constraints,
                    options={"ftol": 1e-10, "maxiter": 500})
     if not res.success or np.any(np.isnan(res.x)):
         return x0  # fallback
@@ -111,6 +136,10 @@ def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sector
         sector_totals.scatter_add_(1, sector_ids.unsqueeze(0).expand(B, -1), c_per_asset)
         c = sector_totals.gather(1, sector_ids.unsqueeze(0).expand(B, -1))
         return c
+    elif constraint_type == "variance_band":
+        Sigma_x = torch.matmul(x, Sigma)
+        c_var = x * Sigma_x
+        return torch.cat([c_var, -c_var], dim=1)
     elif constraint_type == "dual":
         Sigma_x = torch.matmul(x, Sigma)
         c_var = x * Sigma_x
@@ -127,10 +156,12 @@ def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sector
 def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
                 budgets: torch.Tensor, alpha: float, B: int,
                 num_iters: int = 500, primal_lr: float = 1e-2,
-                dual_lr: float = 10.0, noise_scale: float = 0.1,
+                dual_lr: float = 10.0,
                 device=None, seed: int = 42,
                 constraint_type: str = "variance",
-                shared_lambda: bool = False) -> Tuple[torch.Tensor, Dict]:
+                shared_lambda: bool = False,
+                objective_scale: float = 1.0,
+                constraint_scale: float = 1.0) -> Tuple[torch.Tensor, Dict]:
     """Primal-dual Langevin on z-space.
 
     constraint_type: "variance" → c_j = x_j (Σx)_j, "shortfall" → c_j = x_j E[(α−rᵀx)₊].
@@ -149,10 +180,11 @@ def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
         z_req = z.detach().requires_grad_(True)
         x = torch.softmax(z_req, dim=-1)
         c = _compute_constraints(x, Sigma, scenarios, alpha, constraint_type)
+        c = c * constraint_scale
         expected_return = torch.matmul(scenarios, x.t()).mean(dim=0)  # [B]
         violation = c - budgets.unsqueeze(0)
         lag_pen = (lam * violation).sum(dim=1)
-        energy = -expected_return + lag_pen
+        energy = -objective_scale * expected_return + lag_pen
 
         grad = torch.autograd.grad(energy.sum(), z_req)[0]
         noise = math.sqrt(2 * primal_lr) * torch.randn_like(z) if k < num_iters - 1 else 0.0
@@ -161,6 +193,7 @@ def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
         with torch.no_grad():
             x_now = torch.softmax(z, dim=-1)
             c_now = _compute_constraints(x_now, Sigma, scenarios, alpha, constraint_type)
+            c_now = c_now * constraint_scale
             v = c_now - budgets.unsqueeze(0)
             if shared_lambda:
                 v_mean = v.mean(dim=0, keepdim=True)
@@ -199,8 +232,24 @@ def project_to_feasible(x: torch.Tensor, Sigma: torch.Tensor,
     """
     w = x.clone()
     B, N = w.shape
-    bud = budgets.unsqueeze(0)  # [1, N]
     Sig_diag = torch.diag(Sigma).unsqueeze(0)  # [1, N]
+    if constraint_type == "variance_band":
+        bud_upper = budgets[:N].unsqueeze(0)       # [1, N] = b_max
+        bud_lower = (-budgets[N:]).unsqueeze(0)     # [1, N] = b_min
+        for _ in range(num_iters):
+            Sw = torch.matmul(w, Sigma)
+            c = w * Sw
+            upper_viol = (c - bud_upper).clamp_min(0.0)
+            lower_viol = (bud_lower - c).clamp_min(0.0)
+            if upper_viol.max().item() < 1e-12 and lower_viol.max().item() < 1e-12:
+                break
+            dc_diag = Sig_diag * w + Sw
+            step = (upper_viol - lower_viol) / dc_diag.abs().clamp_min(1e-12)
+            w = w - step
+            w = w.clamp_min(0.0)
+            w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return w.detach()
+    bud = budgets.unsqueeze(0)  # [1, N]
     for _ in range(num_iters):
         Sw = torch.matmul(w, Sigma)  # [B, N]
         c = w * Sw                    # [B, N]

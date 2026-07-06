@@ -238,6 +238,16 @@ def make_portfolio_problem(
     elif constraint_type == "shortfall":
         shortfall_eq = np.maximum(alpha - port_ret_eq, 0.0).mean()
         c_eq = x_eq * shortfall_eq  # [N] (uniform since x_eq is uniform)
+    elif constraint_type == "variance_band":
+        Sigma_x_eq = Sigma @ x_eq
+        c_eq = x_eq * Sigma_x_eq
+        b_max = gamma * c_eq
+        b_min = c_eq / gamma
+        budgets = np.concatenate([
+            b_max,      # upper bounds: c_j <= gamma * c_eq_j
+            -b_min,     # lower bounds encoded: -c_j <= -c_eq_j / gamma
+        ])
+        return mu, Sigma, scenarios, budgets, alpha
     elif constraint_type == "dual":
         Sigma_x_eq = Sigma @ x_eq
         c_var = x_eq * Sigma_x_eq
@@ -334,6 +344,7 @@ class PortfolioEnergyDDPM(EnergyDDPM):
         self.objective_scale = float(objective_scale)
         self.constraint_type = constraint_type
         self._num_sectors = int(kwargs.pop("num_sectors", 10))
+        self._constraint_scale = float(kwargs.pop("constraint_scale", 1.0))
         self.use_dps_guidance = bool(kwargs.pop("use_dps_guidance", False))
         # clip_denoised=False: z-space is unconstrained.
         # Pass dummy WRA-specific params that won't be used (overridden methods
@@ -503,9 +514,9 @@ class PortfolioEnergyDDPM(EnergyDDPM):
         weights = self._z_to_weights(x)  # [B, N]
 
         if self.constraint_type == "variance":
-            c = self._variance_contributions(weights, context.Sigma)
+            c = self._variance_contributions(weights, context.Sigma) * self._constraint_scale
         elif self.constraint_type == "variance_sector":
-            c_per_asset = self._variance_contributions(weights, context.Sigma)
+            c_per_asset = self._variance_contributions(weights, context.Sigma) * self._constraint_scale
             B, N = weights.shape
             S = self._num_sectors
             sector_ids = torch.arange(N, device=weights.device) % S
@@ -516,6 +527,12 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             c = sector_totals.gather(1, sector_ids.unsqueeze(0).expand(B, -1))
         elif self.constraint_type == "shortfall":
             c = self._shortfall_contributions(weights, context.scenarios, context.alpha)
+        elif self.constraint_type == "variance_band":
+            c_var = self._variance_contributions(weights, context.Sigma) * self._constraint_scale
+            negated_c = torch.cat([-c_var, c_var], dim=1)  # [B, 2N]
+            ret_per_scenario = torch.matmul(context.scenarios, weights.t())
+            expected_return = ret_per_scenario.mean(dim=0)
+            return negated_c, expected_return
         elif self.constraint_type == "dual":
             c_var = self._variance_contributions(weights, context.Sigma)
             c_short = self._shortfall_contributions(weights, context.scenarios, context.alpha)
@@ -559,9 +576,7 @@ class PortfolioEnergyDDPM(EnergyDDPM):
         # = sum_j lambda_j * (r_min_j - negated_risk_j)   [via sign trick]
         violation = context.r_min - negated_risk  # [B, N]
         if self.normalize_constraints:
-            # Option A rescaling: divide by b_j so constraint is
-            # (c_j/b_j - 1) <= 0; violation lives on unit scale.
-            violation = violation / context.risk_budgets.unsqueeze(0).clamp_min(1e-12)
+            violation = violation / context.risk_budgets.unsqueeze(0).abs().clamp_min(1e-12)
         lagrangian_term = (violation * dual_lambda).sum(dim=1)  # [B]
 
         # Resolve inverse_beta

@@ -96,6 +96,11 @@ bash scripts/wra/baselines.sh
 bash scripts/portfolio/train.sh
 ```
 
+### Portfolio: Evaluate PDI along with baselines
+```bash
+bash scripts/portfolio/eval.sh "outputs/portfolio/score_net_train/2026-06-30_15-31-38 - crypto_ib2000_ds300_mumax1500_rho0.7_v13_K1_cosine/score_net_best_pareto.pt" old_config
+```
+
 ## Citation
 
 ```bibtex

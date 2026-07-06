@@ -35,7 +35,7 @@ if _SRC not in sys.path:
 
 from pdi.diffusion.portfolio_energy_ddpm import (  # noqa: E402
     PortfolioEnergyDDPM, make_portfolio_problem, shortfall_contributions_torch,
-    variance_contributions_torch,
+    variance_contributions_torch, variance_contributions_np,
 )
 
 
@@ -120,13 +120,19 @@ def _run_one(ib: float, dual_step: float, use_dual: bool,
               use_dps: bool = False,
               constraint_type: str = "variance",
               num_sectors: int = 10,
-              dual_lambda_decay: float = 0.0) -> dict:
+              dual_lambda_decay: float = 0.0,
+              objective_scale: float = 1.0,
+              constraint_scale: float = 1.0) -> dict:
     torch.manual_seed(seed)
     effective_step = dual_step if use_dual else 1e-12
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        bud_scaled = budgets * constraint_scale
+    else:
+        bud_scaled = budgets
     sampler = PortfolioEnergyDDPM(
         model=_NoOp(), num_timesteps=T, beta_schedule=beta_schedule,
         portfolio_mu=mu, portfolio_Sigma=Sigma,
-        portfolio_scenarios=scenarios, portfolio_risk_budgets=budgets,
+        portfolio_scenarios=scenarios, portfolio_risk_budgets=bud_scaled,
         portfolio_alpha=alpha,
         energy_mc_samples=K,
         inverse_beta=ib, inverse_beta_schedule="constant",
@@ -141,6 +147,8 @@ def _run_one(ib: float, dual_step: float, use_dual: bool,
         use_dps_guidance=use_dps,
         constraint_type=constraint_type,
         num_sectors=num_sectors,
+        objective_scale=objective_scale,
+        constraint_scale=constraint_scale,
     ).to(device)
 
     data = _make_batch(B, N).to(device)
@@ -219,7 +227,17 @@ def main():
         pcfg["high_risk_budget_scale"] = args.high_risk_budget_scale
     mu, Sigma, scenarios, budgets, alpha = make_portfolio_problem(**pcfg)
     N = pcfg["N"]
+    if args.constraint_type in ("variance", "variance_band", "variance_sector"):
+        _c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma).mean()
+        _ret_mean = abs(scenarios.mean(axis=0)).mean()
+        _obj_scale = 1.0 / max(_ret_mean, 1e-12)
+        _constraint_scale = 1.0 / max(_c_eq_mean, 1e-12)
+    else:
+        _obj_scale = 1.0
+        _constraint_scale = 1.0
     print(f"alpha threshold = {alpha:.5f}")
+    if _constraint_scale != 1.0:
+        print(f"O(1) scaling: obj_scale={_obj_scale:.4g} constraint_scale={_constraint_scale:.4g}")
 
     ibs = [float(x) for x in args.ib_grid.split(",")]
     dual_steps = [float(x) for x in args.dual_step_grid.split(",")]
@@ -237,7 +255,9 @@ def main():
                          beta_schedule=args.beta_schedule,
                          use_dps=args.dps,
                          constraint_type=args.constraint_type,
-                         num_sectors=args.num_sectors or 10)
+                         num_sectors=args.num_sectors or 10,
+                         objective_scale=_obj_scale,
+                         constraint_scale=_constraint_scale)
             m["label"] = f"uncon_ib{ib:g}"
             results.append(m)
             print(f"  feas={m['feasibility_rate']:.3f}  ret={m['expected_return']:.4f}  "
@@ -266,7 +286,9 @@ def main():
                                  use_dps=args.dps,
                                  constraint_type=args.constraint_type,
                                  num_sectors=args.num_sectors or 10,
-                                 dual_lambda_decay=decay)
+                                 dual_lambda_decay=decay,
+                                 objective_scale=_obj_scale,
+                                 constraint_scale=_constraint_scale)
                     m["label"] = tag
                     m["lam0"] = l0
                     m["decay"] = decay

@@ -19,6 +19,7 @@ if _SRC not in sys.path:
 from pdi.diffusion.portfolio_energy_ddpm import (
     PortfolioEnergyDDPM, make_portfolio_problem,
     variance_contributions_torch, shortfall_contributions_torch,
+    variance_contributions_np,
 )
 from pdi.models.portfolio_gnn_backbone import (
     PortfolioGNNBackbone, build_dense_adjacency,
@@ -59,16 +60,19 @@ def metrics_per_instance(w, Sigma, scenarios, budgets, alpha, constraint_type):
 
 
 def run_ced_trained(score_net, mu, Sig, scen, bud, alpha, A_dense, B, T, device,
-                    ib, ds, decay, lam0, lam_max, constraint_type):
+                    ib, ds, decay, lam0, lam_max, constraint_type,
+                    objective_scale=1.0, constraint_scale=1.0):
+    bud_scaled = bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else bud
     sampler = PortfolioEnergyDDPM(
         model=_NoOp(), num_timesteps=T, beta_schedule="cosine",
         portfolio_mu=mu, portfolio_Sigma=Sig, portfolio_scenarios=scen,
-        portfolio_risk_budgets=bud, portfolio_alpha=alpha,
+        portfolio_risk_budgets=bud_scaled, portfolio_alpha=alpha,
         energy_mc_samples=512, inverse_beta=ib, inverse_beta_schedule="constant",
         dual_update_mode="x0_pred", dual_step_size=ds,
         dual_lambda_init=lam0, dual_lambda_max=lam_max,
         dual_lambda_decay=decay, shared_lambda=True,
         normalize_constraints=False, constraint_type=constraint_type, num_sectors=10,
+        objective_scale=objective_scale, constraint_scale=constraint_scale,
     ).to(device)
     acp = sampler.alphas_cumprod.to(device)
     pc1 = sampler.posterior_mean_coef1.to(device)
@@ -93,8 +97,9 @@ def run_ced_trained(score_net, mu, Sig, scen, bud, alpha, A_dense, B, T, device,
         z = x0[:, 0, :, 0]; w = torch.softmax(z, dim=-1)
         zp = torch.log(w.clamp_min(1e-12)); zp = zp - zp.mean(dim=-1, keepdim=True)
         x0 = zp.view(B, 1, len(mu), 1)
-        c = variance_contributions_torch(w, Sigma_t)
-        viol = (c - budgets_t.unsqueeze(0)).mean(dim=0)
+        c = variance_contributions_torch(w, Sigma_t) * constraint_scale
+        budgets_scaled_t = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+        viol = (c - budgets_scaled_t.unsqueeze(0)).mean(dim=0)
         lam = ((1-decay)*lam + ds*viol.unsqueeze(0)).clamp(0, lam_max)
         mean = pc1[t_int]*x0 + pc2[t_int]*x_t
         x_t = mean + pv[t_int].sqrt().clamp_min(0)*torch.randn_like(x_t) if t_int > 0 else mean
@@ -102,16 +107,19 @@ def run_ced_trained(score_net, mu, Sig, scen, bud, alpha, A_dense, B, T, device,
 
 
 def run_mc_ceiling(mu, Sig, scen, bud, alpha, B, T, K, device,
-                   ib, ds, decay, lam0, lam_max, constraint_type):
+                   ib, ds, decay, lam0, lam_max, constraint_type,
+                   objective_scale=1.0, constraint_scale=1.0):
+    bud_scaled = bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else bud
     sampler = PortfolioEnergyDDPM(
         model=_NoOp(), num_timesteps=T, beta_schedule="cosine",
         portfolio_mu=mu, portfolio_Sigma=Sig, portfolio_scenarios=scen,
-        portfolio_risk_budgets=bud, portfolio_alpha=alpha,
+        portfolio_risk_budgets=bud_scaled, portfolio_alpha=alpha,
         energy_mc_samples=K, inverse_beta=ib, inverse_beta_schedule="constant",
         dual_update_mode="x0_pred", dual_step_size=ds,
         dual_lambda_init=lam0, dual_lambda_max=lam_max,
         dual_lambda_decay=decay, shared_lambda=True,
         normalize_constraints=False, constraint_type=constraint_type, num_sectors=10,
+        objective_scale=objective_scale, constraint_scale=constraint_scale,
     ).to(device)
     from torch_geometric.data import Data, Batch
     N = len(mu)
@@ -124,10 +132,12 @@ def run_mc_ceiling(mu, Sig, scen, bud, alpha, B, T, K, device,
     return sampler.z_to_portfolio_weights(z)
 
 
-def run_unconstrained_mc(mu, Sig, scen, bud, alpha, B, T, K, device, constraint_type):
+def run_unconstrained_mc(mu, Sig, scen, bud, alpha, B, T, K, device, constraint_type,
+                         objective_scale=1.0, constraint_scale=1.0):
     return run_mc_ceiling(mu, Sig, scen, bud, alpha, B, T, K, device,
                           ib=2000, ds=1e-10, decay=0, lam0=0, lam_max=1e-10,
-                          constraint_type=constraint_type)
+                          constraint_type=constraint_type,
+                          objective_scale=objective_scale, constraint_scale=constraint_scale)
 
 
 def main():
@@ -156,6 +166,20 @@ def main():
     pcfg = dict(PROBLEM_CONFIGS[args.size])
     N = pcfg["N"]
     constraint_type = pcfg.pop("constraint_type", "shortfall")
+
+    # O(1) energy scaling for variance-based constraints
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        # Compute from seed=0 instance as reference
+        _ref_mu, _ref_Sig, _ref_scen, _ref_bud, _ = make_portfolio_problem(
+            seed=0, constraint_type=constraint_type, **pcfg)
+        _c_eq_mean = variance_contributions_np(
+            np.ones(pcfg["N"]) / pcfg["N"], _ref_Sig).mean()
+        _ret_mean = abs(_ref_scen.mean(axis=0)).mean()
+        _obj_scale = 1.0 / max(_ret_mean, 1e-12)
+        _constraint_scale = 1.0 / max(_c_eq_mean, 1e-12)
+    else:
+        _obj_scale = 1.0
+        _constraint_scale = 1.0
 
     # Load trained score net
     backbone = PortfolioGNNBackbone(d=N, hidden=args.hidden, num_layers=args.num_layers,
@@ -186,7 +210,8 @@ def main():
         t0 = time.time()
         w_ced = run_ced_trained(score_net, mu, Sig, scen, bud, alpha, A_dense,
                                 args.B, args.T, device, args.ib, args.ds, args.decay,
-                                args.lam0, args.lam_max, constraint_type)
+                                args.lam0, args.lam_max, constraint_type,
+                                objective_scale=_obj_scale, constraint_scale=_constraint_scale)
         m = metrics_per_instance(w_ced, Sigma_t, scen_t, bud_t, alpha, constraint_type)
         all_results["ced_trained"].append(m)
         print(f"  CED-trained: ret={m['ret']:.4f} sharpe={m['sharpe']:.3f} csat={m['csat']:.3f} O2max={m['o2max']:.6f} Neff={m['neff']:.1f} |top1|={m['top1']} ({time.time()-t0:.1f}s)")
@@ -195,7 +220,8 @@ def main():
         t0 = time.time()
         w_mc = run_mc_ceiling(mu, Sig, scen, bud, alpha, args.B, args.T, args.K, device,
                               args.ib, args.ds, args.decay, args.lam0, args.lam_max,
-                              constraint_type)
+                              constraint_type,
+                              objective_scale=_obj_scale, constraint_scale=_constraint_scale)
         m = metrics_per_instance(w_mc, Sigma_t, scen_t, bud_t, alpha, constraint_type)
         all_results["mc_ceiling"].append(m)
         print(f"  MC-ceiling:  ret={m['ret']:.4f} sharpe={m['sharpe']:.3f} csat={m['csat']:.3f} O2max={m['o2max']:.6f} Neff={m['neff']:.1f} |top1|={m['top1']} ({time.time()-t0:.1f}s)")
@@ -203,11 +229,14 @@ def main():
         # PDL
         t0 = time.time()
         mu_t = torch.tensor(mu, dtype=torch.float32, device=device)
-        w_pdl, _ = pd_langevin(mu_t, Sigma_t, scen_t, bud_t, alpha=float(alpha),
+        bud_scaled_t = torch.tensor(bud * _constraint_scale, dtype=torch.float32, device=device) if constraint_type in ("variance", "variance_band", "variance_sector") else bud_t
+        w_pdl, _ = pd_langevin(mu_t, Sigma_t, scen_t, bud_scaled_t, alpha=float(alpha),
                                 B=args.B, num_iters=args.pdl_iters,
                                 primal_lr=args.pdl_plr, dual_lr=args.pdl_dlr,
-                                noise_scale=0.01, device=device, seed=42,
-                                constraint_type=constraint_type)
+                                device=device, seed=42,
+                                constraint_type=constraint_type,
+                                objective_scale=_obj_scale,
+                                constraint_scale=_constraint_scale)
         m = metrics_per_instance(w_pdl, Sigma_t, scen_t, bud_t, alpha, constraint_type)
         all_results["pd_langevin"].append(m)
         print(f"  PDL:         ret={m['ret']:.4f} sharpe={m['sharpe']:.3f} csat={m['csat']:.3f} O2max={m['o2max']:.6f} Neff={m['neff']:.1f} |top1|={m['top1']} ({time.time()-t0:.1f}s)")
@@ -215,7 +244,8 @@ def main():
         # Unconstrained MC
         t0 = time.time()
         w_unc = run_unconstrained_mc(mu, Sig, scen, bud, alpha, args.B, args.T, args.K,
-                                     device, constraint_type)
+                                     device, constraint_type,
+                                     objective_scale=_obj_scale, constraint_scale=_constraint_scale)
         m = metrics_per_instance(w_unc, Sigma_t, scen_t, bud_t, alpha, constraint_type)
         all_results["unconstrained_mc"].append(m)
         print(f"  Uncon-MC:    ret={m['ret']:.4f} sharpe={m['sharpe']:.3f} csat={m['csat']:.3f} O2max={m['o2max']:.6f} Neff={m['neff']:.1f} |top1|={m['top1']} ({time.time()-t0:.1f}s)")

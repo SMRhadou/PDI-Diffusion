@@ -81,6 +81,9 @@ PROBLEM_CONFIGS = {
     "crypto_dual": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
                         structure="sectors", num_sectors=10,
                         constraint_type="dual", budget_type="uniform"),
+    "crypto_band": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
+                        structure="sectors", num_sectors=10,
+                        constraint_type="variance_band"),
 }
 
 
@@ -109,7 +112,7 @@ METHOD_LABELS = {
     "markowitz_constrained": "Markowitz\n(con)",
     "unconstrained_mc": "Uncon (MC)",
     "unconstrained_net": "Uncon (net)",
-    "mc_teacher": "CED-ceiling",
+    "mc_teacher": "PDI-MC",
     "pdm_mc": "PDM (MC)",
     "pdm_net": "PDM (net)",
     "dps_mc": "DPS (MC)",
@@ -117,9 +120,9 @@ METHOD_LABELS = {
     "rejection": "DDPM\n+reject",
     "pd_langevin": "PDL",
     "policy_net": "Policy\nnet",
-    "ced_trained": "CED (ours)",
-    "ced_ceiling_fixlam": r"CED-ceil ($\lambda^*$)",
-    "ced_trained_fixlam": r"CED-ours ($\lambda^*$)",
+    "ced_trained": "PDI-Net",
+    "ced_ceiling_fixlam": r"PDI-MC ($\lambda^*$)",
+    "ced_trained_fixlam": r"PDI-Net ($\lambda^*$)",
     "pdm_net_lam1": r"PDM ($\lambda\!=\!1$)",
     "pdm_net_lam300": r"PDM ($\lambda\!=\!300$)",
     "mc_fix_lamfinal1": r"MC fix $\lambda^*_1$",
@@ -251,6 +254,17 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
     constraint_type = pcfg.pop("constraint_type", "shortfall")
     mu_np, Sigma_np, scen_np, bud_np, alpha_np = make_portfolio_problem(
         constraint_type=constraint_type, **pcfg)
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+        ret_mean = abs(scen_np.mean(axis=0)).mean()
+        _obj_scale = 1.0 / max(ret_mean, 1e-12)
+        _constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
+        bud_scaled = bud_np * _constraint_scale
+    else:
+        _obj_scale = 1.0
+        _constraint_scale = 1.0
+        bud_scaled = bud_np
+
     mu = torch.tensor(mu_np, dtype=torch.float32, device=device)
     Sigma = torch.tensor(Sigma_np, dtype=torch.float32, device=device)
     scenarios = torch.tensor(scen_np, dtype=torch.float32, device=device)
@@ -260,7 +274,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         return PortfolioEnergyDDPM(
             model=_NoOp(), num_timesteps=T, beta_schedule=beta_schedule,
             portfolio_mu=mu_np, portfolio_Sigma=Sigma_np,
-            portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_np,
+            portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_scaled,
             portfolio_alpha=alpha_np,
             energy_mc_samples=K,
             inverse_beta=ib_, inverse_beta_schedule="constant",
@@ -271,8 +285,10 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             dual_lambda_decay=dual_lambda_decay,
             shared_lambda=True,
             normalize_constraints=normalize_constraints,
+            objective_scale=_obj_scale,
             constraint_type=constraint_type,
             num_sectors=pcfg.get("num_sectors", 10),
+            constraint_scale=_constraint_scale,
         ).to(device)
 
     shape = (B, 1, N, 1)
@@ -286,7 +302,8 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
     weights["markowitz_unconstrained"] = torch.tensor(mu_u, dtype=torch.float32,
                                                         device=device).unsqueeze(0).expand(B, -1).contiguous()
     bud_for_mkz = bud_np[:N] if constraint_type == "dual" else bud_np
-    mu_c = bl.markowitz_constrained(mu_np, Sigma_np, bud_for_mkz, risk_aversion=5.0)
+    mu_c = bl.markowitz_constrained(mu_np, Sigma_np, bud_for_mkz, risk_aversion=5.0,
+                                     constraint_type=constraint_type)
     weights["markowitz_constrained"] = torch.tensor(mu_c, dtype=torch.float32,
                                                       device=device).unsqueeze(0).expand(B, -1).contiguous()
 
@@ -440,13 +457,15 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         _N = N
         _Sig = Sigma
         _scen = scenarios
-        _bud = budgets
+        _bud = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
         _alpha_val = float(alpha_np)
+        _cs_dps = _constraint_scale
         _ct = constraint_type
         _dps_alphas_cumprod = s_dps.alphas_cumprod
         def _dps_correct(self, x_t, t, x0_pred, eps_pred,
                          _s=dps_scale, _sc=_scen, _b=_bud, _a=_alpha_val,
-                         _n=_N, _sig=_Sig, _ctype=_ct, _ac=_dps_alphas_cumprod):
+                         _n=_N, _sig=_Sig, _ctype=_ct, _ac=_dps_alphas_cumprod,
+                         _cscale=_cs_dps):
             B_loc = x_t.shape[0]
             x_t_g = x_t.detach().requires_grad_(True)
             alpha_bar = _ac[t].view(-1, 1, 1, 1)
@@ -456,12 +475,15 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             w_g = torch.softmax(x0_tw[:, 0, :, 0], dim=-1)
             if _ctype == "shortfall":
                 c_g = shortfall_contributions_torch(w_g, _sc, _a)
+            elif _ctype == "variance_band":
+                c_var = variance_contributions_torch(w_g, _sig) * _cscale
+                c_g = torch.cat([c_var, -c_var], dim=-1)
             elif _ctype == "dual":
                 c_var = variance_contributions_torch(w_g, _sig)
                 c_short = shortfall_contributions_torch(w_g, _sc, _a)
                 c_g = torch.cat([c_var, c_short], dim=-1)
             else:
-                c_g = variance_contributions_torch(w_g, _sig)
+                c_g = variance_contributions_torch(w_g, _sig) * _cscale
             loss = ((c_g - _b.unsqueeze(0)).clamp_min(0.0) ** 2).sum()
             grad_xt = torch.autograd.grad(loss, x_t_g)[0]
             x_t_corrected = (x_t - _s * grad_xt).detach()
@@ -487,11 +509,16 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
 
     if not mc_only:
         # PD-Langevin (per-sample lambda; ib removed)
-        w_pdl, _ = bl.pd_langevin(mu, Sigma, scenarios, budgets, alpha=float(alpha_np), B=B,
-                                    num_iters=500, primal_lr=pdl_primal_lr,
-                                    dual_lr=pdl_dual_lr, noise_scale=pdl_noise_scale,
+        _pdl_plr = pdl_primal_lr
+        _pdl_dlr = pdl_dual_lr
+        _bud_pdl = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+        w_pdl, _ = bl.pd_langevin(mu, Sigma, scenarios, _bud_pdl, alpha=float(alpha_np), B=B,
+                                    num_iters=500, primal_lr=_pdl_plr,
+                                    dual_lr=_pdl_dlr,
                                     device=device, seed=seed,
-                                    constraint_type=constraint_type)
+                                    constraint_type=constraint_type,
+                                    objective_scale=_obj_scale,
+                                    constraint_scale=_constraint_scale)
         weights["pd_langevin"] = w_pdl.detach()
 
         pass  # policy_net skipped
@@ -571,12 +598,13 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         weights["unconstrained_net"] = s_unc.z_to_portfolio_weights(z_unc).detach()
 
         # PDM (net) = trained net + per-step x_t projection, lambda=0
-        torch.manual_seed(seed)
-        s_pdm_net = _mk_sampler(ib, 1e-12, lam0_override=0.0)
-        s_pdm_net._estimate_score = _types_net.MethodType(trained_score_fn, s_pdm_net)
-        z_pdm_net = _pdm_sample(s_pdm_net, shape, device, data,
-                                 Sigma, budgets, constraint_type)
-        weights["pdm_net"] = s_pdm_net.z_to_portfolio_weights(z_pdm_net).detach()
+        if constraint_type != "dual":
+            torch.manual_seed(seed)
+            s_pdm_net = _mk_sampler(ib, 1e-12, lam0_override=0.0)
+            s_pdm_net._estimate_score = _types_net.MethodType(trained_score_fn, s_pdm_net)
+            z_pdm_net = _pdm_sample(s_pdm_net, shape, device, data,
+                                     Sigma, budgets, constraint_type)
+            weights["pdm_net"] = s_pdm_net.z_to_portfolio_weights(z_pdm_net).detach()
 
         # DPS (net) = trained net + gradient guidance, lambda=0
         def _run_dps_net(scale, label):
@@ -585,10 +613,13 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             s_d._estimate_score = _types_net.MethodType(trained_score_fn, s_d)
             _ac_d = s_d.alphas_cumprod
             _s_d = scale
+            _bud_d = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+            _cs_d = _constraint_scale
             def _dps_correct_d(self, x_t, t, x0_pred, eps_pred,
-                               _s=_s_d, _sc=scenarios, _b=budgets,
+                               _s=_s_d, _sc=scenarios, _b=_bud_d,
                                _a=float(alpha_np), _n=N, _sig=Sigma,
-                               _ctype=constraint_type, _ac=_ac_d):
+                               _ctype=constraint_type, _ac=_ac_d,
+                               _cscale=_cs_d):
                 B_loc = x_t.shape[0]
                 x_t_g = x_t.detach().requires_grad_(True)
                 alpha_bar = _ac[t].view(-1, 1, 1, 1)
@@ -598,12 +629,15 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                 w_g = torch.softmax(x0_tw[:, 0, :, 0], dim=-1)
                 if _ctype == "shortfall":
                     c_g = shortfall_contributions_torch(w_g, _sc, _a)
+                elif _ctype == "variance_band":
+                    c_var = variance_contributions_torch(w_g, _sig) * _cscale
+                    c_g = torch.cat([c_var, -c_var], dim=-1)
                 elif _ctype == "dual":
                     c_var = variance_contributions_torch(w_g, _sig)
                     c_short = shortfall_contributions_torch(w_g, _sc, _a)
                     c_g = torch.cat([c_var, c_short], dim=-1)
                 else:
-                    c_g = variance_contributions_torch(w_g, _sig)
+                    c_g = variance_contributions_torch(w_g, _sig) * _cscale
                 loss = ((c_g - _b.unsqueeze(0)).clamp_min(0.0) ** 2).sum()
                 grad_xt = torch.autograd.grad(loss, x_t_g)[0]
                 x_t_corrected = (x_t - _s * grad_xt).detach()
@@ -815,6 +849,9 @@ def _compute_contributions_np(w, problem):
     ct = problem.get("constraint_type", "shortfall")
     if ct == "shortfall":
         return shortfall_contributions_np(w, problem["scenarios"], problem["alpha"])
+    elif ct == "variance_band":
+        c_var = variance_contributions_np(w, problem["Sigma"])
+        return np.concatenate([c_var, -c_var], axis=-1)
     elif ct in ("variance", "variance_sector"):
         return variance_contributions_np(w, problem["Sigma"])
     elif ct == "dual":
@@ -837,7 +874,7 @@ def _per_instance_metrics(weights_dict, problem, methods, eps_feas=0.1):
         w = weights_dict[m].cpu().numpy()
         c = _compute_contributions_np(w, problem)
         violation = np.maximum(c - bud[None, :], 0.0)
-        rel_vio = violation / np.maximum(bud[None, :], 1e-12)
+        rel_vio = violation / np.maximum(np.abs(bud[None, :]), 1e-12)
         ret = (scen @ w.T).mean(axis=0)
         var = np.einsum('bi,ij,bj->b', w, Sigma, w)
         sharpe = ret / np.sqrt(np.clip(var, 1e-12, None))
@@ -847,7 +884,7 @@ def _per_instance_metrics(weights_dict, problem, methods, eps_feas=0.1):
         c_mean = c.mean(axis=0)
         opt2_feas = float((c_mean <= bud + 1e-8).all())
         opt2_csat = float((c_mean <= bud + 1e-8).mean())
-        opt2_vio = np.maximum(c_mean - bud, 0.0) / np.maximum(bud, 1e-12)
+        opt2_vio = np.maximum(c_mean - bud, 0.0) / np.maximum(np.abs(bud), 1e-12)
         opt2_max_rel = float(opt2_vio.max()) if opt2_vio.size else 0.0
         # Cross-sample diversity: how many distinct assets win the top-1 spot,
         # and the entropy of that distribution.
@@ -2465,7 +2502,12 @@ def main():
                         help="Sweep inverse_beta with fixed ds, trace vio+return over steps.")
     parser.add_argument("--study-only", action="store_true",
                         help="Skip all baselines, only run study flags.")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Override budget tightness gamma for the chosen --size preset.")
     args = parser.parse_args()
+
+    if args.gamma is not None:
+        PROBLEM_CONFIGS[args.size]["gamma"] = args.gamma
 
     # Auto-detect architecture params from checkpoint's summary.json
     if args.ced_ckpt is not None:

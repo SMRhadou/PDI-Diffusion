@@ -62,6 +62,9 @@ PROBLEM_CONFIGS = {
     "sectors_shortfall_g3": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
                                  structure="sectors", num_sectors=10,
                                  constraint_type="shortfall"),
+    "crypto_band": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
+                        structure="sectors", num_sectors=10,
+                        constraint_type="variance_band"),
 }
 
 
@@ -100,7 +103,10 @@ def _eval_metrics_per_instance(w, Sigma, scenarios, budgets, alpha,
                                constraint_type="shortfall"):
     """Compute metrics for ONE problem instance. Matches figures.py table metrics."""
     with torch.no_grad():
-        if constraint_type in ("variance", "variance_sector"):
+        if constraint_type == "variance_band":
+            c_var = variance_contributions_torch(w, Sigma)
+            c = torch.cat([c_var, -c_var], dim=1)  # [B, 2N]
+        elif constraint_type in ("variance", "variance_sector"):
             c = variance_contributions_torch(w, Sigma)
         else:
             c = shortfall_contributions_torch(w, scenarios, alpha)
@@ -226,6 +232,21 @@ def main():
     constraint_type = pcfg.pop("constraint_type", "shortfall")
     mu_np, Sigma_np, scen_np, bud_np, alpha = make_portfolio_problem(
         constraint_type=constraint_type, **pcfg)
+    if constraint_type in ("variance", "variance_band", "variance_sector"):
+        from pdi.diffusion.portfolio_energy_ddpm import variance_contributions_np
+        c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+        ret_mean = abs(scen_np.mean(axis=0)).mean()
+        obj_scale = 1.0 / max(ret_mean, 1e-12)
+        constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
+        bud_scaled = bud_np * constraint_scale
+        log.info("O(1) energy scaling: obj_scale=%.4g constraint_scale=%.4g "
+                 "c_eq_mean=%.4e ret_mean=%.4e", obj_scale, constraint_scale,
+                 c_eq_mean, ret_mean)
+    else:
+        obj_scale = 1.0
+        constraint_scale = 1.0
+        bud_scaled = bud_np
+
     mu = torch.tensor(mu_np, dtype=torch.float32, device=device)
     Sigma = torch.tensor(Sigma_np, dtype=torch.float32, device=device)
     scenarios = torch.tensor(scen_np, dtype=torch.float32, device=device)
@@ -267,7 +288,8 @@ def main():
             model=_NoOpModel(),
             num_timesteps=args.T, beta_schedule=args.beta_schedule,
             portfolio_mu=mu_np, portfolio_Sigma=Sigma_np,
-            portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_np, portfolio_alpha=alpha,
+            portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_scaled,
+            portfolio_alpha=alpha,
             energy_mc_samples=args.mc_samples_train,
             inverse_beta=args.ib, inverse_beta_schedule="constant",
             dual_update_mode="x0_pred",
@@ -277,8 +299,10 @@ def main():
             dual_lambda_decay=args.dual_lambda_decay,
             shared_lambda=args.shared_lambda,
             normalize_constraints=not args.no_normalize,
+            objective_scale=obj_scale,
             constraint_type=constraint_type,
             num_sectors=pcfg.get("num_sectors", 10),
+            constraint_scale=constraint_scale,
         )
     mc_sampler = _mk_training_sampler()
 
@@ -513,6 +537,7 @@ def main():
         v_mu, v_Sig, v_scen, v_bud, v_alpha = make_portfolio_problem(
             constraint_type=_vct, **_vpcfg)
         v_A_np = build_dense_adjacency(v_Sig, top_k=20)
+        v_bud_scaled = v_bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else v_bud
         val_instances.append({
             "mu_np": v_mu, "Sigma_np": v_Sig, "scen_np": v_scen,
             "bud_np": v_bud, "alpha": v_alpha,
@@ -520,6 +545,7 @@ def main():
             "Sigma": torch.tensor(v_Sig, dtype=torch.float32, device=device),
             "scenarios": torch.tensor(v_scen, dtype=torch.float32, device=device),
             "budgets": torch.tensor(v_bud, dtype=torch.float32, device=device),
+            "budgets_scaled": torch.tensor(v_bud_scaled, dtype=torch.float32, device=device),
             "A": torch.tensor(v_A_np, dtype=torch.float32, device=device),
         })
     log.info("val dataset: %d instances (seeds 1000-%d)", len(val_instances), 1000 + len(val_instances) - 1)
@@ -529,7 +555,8 @@ def main():
         model=_NoOpModel(),
         num_timesteps=args.T, beta_schedule=args.beta_schedule,
         portfolio_mu=mu_np, portfolio_Sigma=Sigma_np,
-        portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_np, portfolio_alpha=alpha,
+        portfolio_scenarios=scen_np, portfolio_risk_budgets=bud_scaled,
+        portfolio_alpha=alpha,
         energy_mc_samples=args.mc_samples_eval,
         inverse_beta=args.ib, inverse_beta_schedule="constant",
         dual_update_mode="x0_pred",
@@ -539,8 +566,10 @@ def main():
         dual_lambda_decay=args.dual_lambda_decay,
         shared_lambda=args.shared_lambda,
         normalize_constraints=not args.no_normalize,
+        objective_scale=obj_scale,
         constraint_type=constraint_type,
         num_sectors=pcfg.get("num_sectors", 10),
+        constraint_scale=constraint_scale,
     ).to(device)
     _alphas_cumprod = _ref_sampler.alphas_cumprod.to(device)
     _post_var = _ref_sampler.posterior_variance.to(device)
@@ -597,14 +626,21 @@ def main():
             for i in range(n_inst):
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
-                if constraint_type in ("variance", "variance_sector"):
-                    c_i = variance_contributions_torch(w_i, val_instances[i]["Sigma"])
+                if constraint_type == "variance_band":
+                    c_var = variance_contributions_torch(w_i, val_instances[i]["Sigma"]) * constraint_scale
+                    negated_c = torch.cat([-c_var, c_var], dim=1)
+                    bud_s = val_instances[i]["budgets_scaled"]
+                    violation_i = (-bud_s).unsqueeze(0) - negated_c
+                elif constraint_type in ("variance", "variance_sector"):
+                    c_i = variance_contributions_torch(w_i, val_instances[i]["Sigma"]) * constraint_scale
+                    violation_i = c_i - val_instances[i]["budgets_scaled"].unsqueeze(0)
                 else:
                     c_i = shortfall_contributions_torch(
                         w_i, val_instances[i]["scenarios"], val_instances[i]["alpha"])
-                violation_i = c_i - val_instances[i]["budgets"].unsqueeze(0)
+                    violation_i = c_i - val_instances[i]["budgets"].unsqueeze(0)
                 if _normalize_val:
-                    violation_i = violation_i / val_instances[i]["budgets"].unsqueeze(0).clamp_min(1e-12)
+                    norm_bud = val_instances[i]["budgets_scaled"] if constraint_type in ("variance", "variance_band", "variance_sector") else val_instances[i]["budgets"]
+                    violation_i = violation_i / norm_bud.unsqueeze(0).abs().clamp_min(1e-12)
                 mean_viol = violation_i.mean(dim=0)
                 step_t = _dual_step_val
                 lam_decayed = (1.0 - _dual_decay_val) * dual_lambda[i]
@@ -701,10 +737,12 @@ def main():
         t_mu, t_Sig, t_scen, t_bud, t_alpha = make_portfolio_problem(
             constraint_type=_tct, **_tpcfg)
         A_np = build_dense_adjacency(t_Sig, top_k=20)
+        t_bud_scaled = t_bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else t_bud
         _all_train_instances.append({
             "Sigma": torch.tensor(t_Sig, dtype=torch.float32, device=device),
             "scenarios": torch.tensor(t_scen, dtype=torch.float32, device=device),
             "budgets": torch.tensor(t_bud, dtype=torch.float32, device=device),
+            "budgets_scaled": torch.tensor(t_bud_scaled, dtype=torch.float32, device=device),
             "alpha": t_alpha,
             "A": torch.tensor(A_np, dtype=torch.float32, device=device),
         })
@@ -764,14 +802,21 @@ def main():
             for i in range(n_inst):
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
-                if constraint_type in ("variance", "variance_sector"):
-                    c_i = variance_contributions_torch(w_i, instances[i]["Sigma"])
+                if constraint_type == "variance_band":
+                    c_var = variance_contributions_torch(w_i, instances[i]["Sigma"]) * constraint_scale
+                    negated_c = torch.cat([-c_var, c_var], dim=1)
+                    bud_s = instances[i]["budgets_scaled"]
+                    violation_i = (-bud_s).unsqueeze(0) - negated_c
+                elif constraint_type in ("variance", "variance_sector"):
+                    c_i = variance_contributions_torch(w_i, instances[i]["Sigma"]) * constraint_scale
+                    violation_i = c_i - instances[i]["budgets_scaled"].unsqueeze(0)
                 else:
                     c_i = shortfall_contributions_torch(
                         w_i, instances[i]["scenarios"], instances[i]["alpha"])
-                violation_i = c_i - instances[i]["budgets"].unsqueeze(0)
+                    violation_i = c_i - instances[i]["budgets"].unsqueeze(0)
                 if _normalize_val:
-                    violation_i = violation_i / instances[i]["budgets"].unsqueeze(0).clamp_min(1e-12)
+                    norm_bud = instances[i]["budgets_scaled"] if constraint_type in ("variance", "variance_band", "variance_sector") else instances[i]["budgets"]
+                    violation_i = violation_i / norm_bud.unsqueeze(0).abs().clamp_min(1e-12)
                 mean_viol = violation_i.mean(dim=0)
                 lam_decayed = (1.0 - _dual_decay_val) * dual_lambda[i]
                 dual_lambda[i] = (lam_decayed + _dual_step_val * mean_viol).clamp(0.0, _dual_max_val)
