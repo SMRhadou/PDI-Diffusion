@@ -122,7 +122,7 @@ def markowitz_constrained(mu: np.ndarray, Sigma: np.ndarray, budgets: np.ndarray
 # Primal-dual Langevin (iterative, no diffusion)
 # ---------------------------------------------------------------
 
-def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sectors=10):
+def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sectors=10, **kwargs):
     """Compute per-asset constraint values c_j(x). Returns [B, N]."""
     if constraint_type == "variance":
         Sigma_x = torch.matmul(x, Sigma)  # [B, N]
@@ -147,6 +147,29 @@ def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sector
         S = torch.clamp_min(alpha - port_ret, 0.0).mean(dim=0)
         c_short = x * S.unsqueeze(-1)
         return torch.cat([c_var, c_short], dim=1)
+    elif constraint_type == "enriched":
+        extra = kwargs.get("extra")
+        B_sz, N = x.shape
+        c_var = x * torch.matmul(x, Sigma)
+        S = num_sectors
+        sector_ids = torch.as_tensor(extra["sector_ids"], device=x.device, dtype=torch.long)
+        exposure = torch.zeros(B_sz, S, device=x.device, dtype=x.dtype)
+        exposure.scatter_add_(1, sector_ids.unsqueeze(0).expand(B_sz, -1), x)
+        sector_upper = torch.as_tensor(extra["sector_upper"], device=x.device, dtype=x.dtype)
+        sector_lower = torch.as_tensor(extra["sector_lower"], device=x.device, dtype=x.dtype)
+        upper_res = exposure - sector_upper.unsqueeze(0)
+        lower_res = sector_lower.unsqueeze(0) - exposure
+        stress_ret_t = torch.as_tensor(extra["stress_returns"], device=x.device, dtype=x.dtype)
+        stress_lim_t = torch.as_tensor(extra["stress_limits"], device=x.device, dtype=x.dtype)
+        stress_eps_t = torch.as_tensor(extra["stress_eps"], device=x.device, dtype=x.dtype)
+        stress_port = torch.matmul(x, stress_ret_t.t())
+        excess_loss = torch.clamp(-stress_port - stress_lim_t.unsqueeze(0), min=0.0)
+        stress_res = excess_loss - stress_eps_t.unsqueeze(0)
+        ent = -(x * torch.log(x.clamp_min(1e-12))).sum(dim=1, keepdim=True)
+        neff_val = torch.exp(ent)
+        neff_target = extra.get("neff_target", 500.0)
+        neff_res = neff_val - neff_target
+        return torch.cat([c_var, upper_res, lower_res, stress_res, neff_res], dim=1)
     else:
         port_ret = torch.matmul(scenarios, x.t())  # [R, B]
         S = torch.clamp_min(alpha - port_ret, 0.0).mean(dim=0)  # [B]
@@ -161,7 +184,8 @@ def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
                 constraint_type: str = "variance",
                 shared_lambda: bool = False,
                 objective_scale: float = 1.0,
-                constraint_scale: float = 1.0) -> Tuple[torch.Tensor, Dict]:
+                constraint_scale: float = 1.0,
+                extra: dict = None) -> Tuple[torch.Tensor, Dict]:
     """Primal-dual Langevin on z-space.
 
     constraint_type: "variance" → c_j = x_j (Σx)_j, "shortfall" → c_j = x_j E[(α−rᵀx)₊].
@@ -176,11 +200,20 @@ def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
     else:
         lam = torch.zeros(B, n_constraints, device=device)
 
+    if extra is not None and "constraint_scales" in extra:
+        _cs_vec = torch.as_tensor(extra["constraint_scales"], dtype=torch.float32, device=device)
+        budgets = budgets * _cs_vec
+    else:
+        _cs_vec = None
+
     for k in range(num_iters):
         z_req = z.detach().requires_grad_(True)
         x = torch.softmax(z_req, dim=-1)
-        c = _compute_constraints(x, Sigma, scenarios, alpha, constraint_type)
-        c = c * constraint_scale
+        c = _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, extra=extra)
+        if _cs_vec is not None:
+            c = c * _cs_vec.unsqueeze(0)
+        else:
+            c = c * constraint_scale
         expected_return = torch.matmul(scenarios, x.t()).mean(dim=0)  # [B]
         violation = c - budgets.unsqueeze(0)
         lag_pen = (lam * violation).sum(dim=1)
@@ -192,8 +225,11 @@ def pd_langevin(mu: torch.Tensor, Sigma: torch.Tensor, scenarios: torch.Tensor,
 
         with torch.no_grad():
             x_now = torch.softmax(z, dim=-1)
-            c_now = _compute_constraints(x_now, Sigma, scenarios, alpha, constraint_type)
-            c_now = c_now * constraint_scale
+            c_now = _compute_constraints(x_now, Sigma, scenarios, alpha, constraint_type, extra=extra)
+            if _cs_vec is not None:
+                c_now = c_now * _cs_vec.unsqueeze(0)
+            else:
+                c_now = c_now * constraint_scale
             v = c_now - budgets.unsqueeze(0)
             if shared_lambda:
                 v_mean = v.mean(dim=0, keepdim=True)
@@ -223,7 +259,8 @@ def project_to_feasible(x: torch.Tensor, Sigma: torch.Tensor,
                          scenarios: torch.Tensor, alpha: float,
                          budgets: torch.Tensor,
                          constraint_type: str = "shortfall",
-                         num_iters: int = 50, lr: float = 0.1) -> torch.Tensor:
+                         num_iters: int = 50, lr: float = 0.1,
+                         extra: dict = None) -> torch.Tensor:
     """Project simplex weights to feasible set via linearised Cimmino projection.
 
     At each iteration, linearise the violated constraints at the current point
@@ -232,6 +269,32 @@ def project_to_feasible(x: torch.Tensor, Sigma: torch.Tensor,
     """
     w = x.clone()
     B, N = w.shape
+    if constraint_type == "enriched":
+        bud_t = budgets.unsqueeze(0)
+        if extra is not None and "constraint_scales" in extra:
+            cs = torch.as_tensor(extra["constraint_scales"], device=x.device, dtype=x.dtype).unsqueeze(0)
+        else:
+            cs = 1.0
+        z = torch.log(w.clamp_min(1e-12))
+        z = z - z.mean(dim=-1, keepdim=True)
+        for _proj_i in range(num_iters):
+            z_req = z.detach().requires_grad_(True)
+            w_cur = torch.softmax(z_req, dim=-1)
+            c = _compute_constraints(w_cur, Sigma, scenarios, alpha,
+                                     constraint_type, extra=extra)
+            viol = ((c - bud_t) * cs).clamp_min(0.0)
+            loss = (viol ** 2).sum()
+            if loss.item() < 1e-16:
+                break
+            grad = torch.autograd.grad(loss, z_req)[0]
+            z = (z_req - lr * grad).detach()
+        w_out = torch.softmax(z, dim=-1).detach()
+        raw_viol = (c - bud_t).clamp_min(0.0)
+        w_out._proj_max_raw_vio = float(raw_viol.max())
+        w_out._proj_mean_raw_vio = float(raw_viol.mean())
+        w_out._proj_frac_satisfied = float((raw_viol.max(dim=1).values < 1e-8).float().mean())
+        w_out._proj_iters_used = _proj_i + 1
+        return w_out
     Sig_diag = torch.diag(Sigma).unsqueeze(0)  # [1, N]
     if constraint_type == "variance_band":
         bud_upper = budgets[:N].unsqueeze(0)       # [1, N] = b_max

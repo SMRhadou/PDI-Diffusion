@@ -38,9 +38,10 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from pdi.diffusion.portfolio_energy_ddpm import (  # noqa: E402
-    PortfolioEnergyDDPM, make_portfolio_problem,
+    PortfolioEnergyDDPM, make_portfolio_problem, make_enriched_portfolio_problem,
     shortfall_contributions_torch, variance_contributions_torch,
 )
+from baselines import _compute_constraints  # noqa: E402
 from pdi.models.portfolio_backbone import (  # noqa: E402
     PortfolioScoreBackbone,
 )
@@ -65,6 +66,9 @@ PROBLEM_CONFIGS = {
     "crypto_band": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
                         structure="sectors", num_sectors=10,
                         constraint_type="variance_band"),
+    "crypto_enriched": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
+                            structure="sectors", num_sectors=10,
+                            budget_type="uniform", constraint_type="enriched"),
 }
 
 
@@ -100,10 +104,12 @@ def _make_trained_score_estimator(score_net, alphas_cumprod, N):
 
 
 def _eval_metrics_per_instance(w, Sigma, scenarios, budgets, alpha,
-                               constraint_type="shortfall"):
+                               constraint_type="shortfall", extra=None):
     """Compute metrics for ONE problem instance. Matches figures.py table metrics."""
     with torch.no_grad():
-        if constraint_type == "variance_band":
+        if constraint_type == "enriched":
+            c = _compute_constraints(w, Sigma, scenarios, alpha, "enriched", extra=extra)
+        elif constraint_type == "variance_band":
             c_var = variance_contributions_torch(w, Sigma)
             c = torch.cat([c_var, -c_var], dim=1)  # [B, 2N]
         elif constraint_type in ("variance", "variance_sector"):
@@ -207,6 +213,9 @@ def main():
     p.add_argument("--backbone", type=str, default="gnn", choices=["mlp", "gnn"])
     p.add_argument("--tagconv-K", type=int, default=2, help="TAGConv hops")
     p.add_argument("--dual-lambda-decay", type=float, default=0.0)
+    p.add_argument("--constraint-type", type=str, default=None,
+                   help="Override constraint type from problem config")
+    p.add_argument("--sector-gamma", type=float, default=1.5)
     p.add_argument("--problem-seed", type=int, default=None,
                    help="Override problem seed (for multi-instance training)")
     p.add_argument("--rotate-every", type=int, default=0,
@@ -230,22 +239,35 @@ def main():
         pcfg["seed"] = args.problem_seed
     N = pcfg["N"]
     constraint_type = pcfg.pop("constraint_type", "shortfall")
-    mu_np, Sigma_np, scen_np, bud_np, alpha = make_portfolio_problem(
-        constraint_type=constraint_type, **pcfg)
-    if constraint_type in ("variance", "variance_band", "variance_sector"):
-        from pdi.diffusion.portfolio_energy_ddpm import variance_contributions_np
-        c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+    if args.constraint_type is not None:
+        constraint_type = args.constraint_type
+    if constraint_type == "enriched":
+        mu_np, Sigma_np, scen_np, bud_np, alpha, _extra_constraints = \
+            make_enriched_portfolio_problem(sector_gamma=args.sector_gamma, **pcfg)
         ret_mean = abs(scen_np.mean(axis=0)).mean()
         obj_scale = 1.0 / max(ret_mean, 1e-12)
-        constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
-        bud_scaled = bud_np * constraint_scale
-        log.info("O(1) energy scaling: obj_scale=%.4g constraint_scale=%.4g "
-                 "c_eq_mean=%.4e ret_mean=%.4e", obj_scale, constraint_scale,
-                 c_eq_mean, ret_mean)
-    else:
-        obj_scale = 1.0
         constraint_scale = 1.0
         bud_scaled = bud_np
+        log.info("enriched problem: %d constraints, obj_scale=%.4g",
+                 len(bud_np), obj_scale)
+    else:
+        mu_np, Sigma_np, scen_np, bud_np, alpha = make_portfolio_problem(
+            constraint_type=constraint_type, **pcfg)
+        _extra_constraints = {}
+        if constraint_type in ("variance", "variance_band", "variance_sector"):
+            from pdi.diffusion.portfolio_energy_ddpm import variance_contributions_np
+            c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+            ret_mean = abs(scen_np.mean(axis=0)).mean()
+            obj_scale = 1.0 / max(ret_mean, 1e-12)
+            constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
+            bud_scaled = bud_np * constraint_scale
+            log.info("O(1) energy scaling: obj_scale=%.4g constraint_scale=%.4g "
+                     "c_eq_mean=%.4e ret_mean=%.4e", obj_scale, constraint_scale,
+                     c_eq_mean, ret_mean)
+        else:
+            obj_scale = 1.0
+            constraint_scale = 1.0
+            bud_scaled = bud_np
 
     mu = torch.tensor(mu_np, dtype=torch.float32, device=device)
     Sigma = torch.tensor(Sigma_np, dtype=torch.float32, device=device)
@@ -269,17 +291,21 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Score net
+    _lambda_channels = 4 if constraint_type == "enriched" else 1
+    _cond_ch = _lambda_channels  # no dataset cond, so total cond = lambda channels
     if args.backbone == "gnn":
         backbone = PortfolioGNNBackbone(
             d=N, hidden=args.hidden, num_layers=args.num_layers,
-            num_timesteps=args.T, K=args.tagconv_K,
+            num_timesteps=args.T, K=args.tagconv_K, cond_channels=_cond_ch,
         )
     else:
         backbone = PortfolioScoreBackbone(
             d=N, hidden=args.hidden, num_layers=args.num_layers,
-            num_timesteps=args.T, cond_channels=1,
+            num_timesteps=args.T, cond_channels=_cond_ch,
         )
-    score_net = ScoreNetWithLambda(backbone=backbone, expected_cond_feats=0)
+    score_net = ScoreNetWithLambda(backbone=backbone, expected_cond_feats=0,
+                                   lambda_channels=_lambda_channels,
+                                   num_sectors=pcfg.get("num_sectors", 10))
     log.info("score_net params: %.2fM", sum(p.numel() for p in score_net.parameters()) / 1e6)
 
     # MC sampler for training
@@ -303,6 +329,7 @@ def main():
             constraint_type=constraint_type,
             num_sectors=pcfg.get("num_sectors", 10),
             constraint_scale=constraint_scale,
+            extra_constraints=_extra_constraints,
         )
     mc_sampler = _mk_training_sampler()
 
@@ -343,10 +370,13 @@ def main():
             alpha_val = data._port_alpha.to(dev)
             mu = mc_sampler._port_mu.to(dev)  # mu not needed for constraints but context requires it
             r_min = (-risk_budgets).unsqueeze(0).expand(batch_size, -1)
-            return PortfolioContext(
+            ctx = PortfolioContext(
                 mu=mu, Sigma=Sigma, scenarios=scenarios,
                 risk_budgets=risk_budgets, alpha=alpha_val, r_min=r_min,
             )
+            if hasattr(data, "_port_extra") and data._port_extra:
+                ctx.extra = data._port_extra
+            return ctx
         return _orig_build_ctx(data)
     trainer._build_micro_context = _patched_build_ctx
 
@@ -379,6 +409,8 @@ def main():
                 group_data._port_scenarios = data._port_scenarios
                 group_data._port_risk_budgets = data._port_risk_budgets
                 group_data._port_alpha = data._port_alpha
+                if hasattr(data, "_port_extra"):
+                    group_data._port_extra = data._port_extra
             group_data = group_data.to(_dev)
             if hasattr(data, "_port_A"):
                 A_inst = data._port_A.to(_dev)
@@ -534,11 +566,17 @@ def main():
         _vpcfg = dict(PROBLEM_CONFIGS[args.size])
         _vpcfg["seed"] = 1000 + vi
         _vct = _vpcfg.pop("constraint_type", "shortfall")
-        v_mu, v_Sig, v_scen, v_bud, v_alpha = make_portfolio_problem(
-            constraint_type=_vct, **_vpcfg)
+        if constraint_type == "enriched":
+            v_mu, v_Sig, v_scen, v_bud, v_alpha, v_extra = \
+                make_enriched_portfolio_problem(
+                    sector_gamma=args.sector_gamma, **_vpcfg)
+        else:
+            v_mu, v_Sig, v_scen, v_bud, v_alpha = make_portfolio_problem(
+                constraint_type=_vct, **_vpcfg)
+            v_extra = {}
         v_A_np = build_dense_adjacency(v_Sig, top_k=20)
         v_bud_scaled = v_bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else v_bud
-        val_instances.append({
+        inst_dict = {
             "mu_np": v_mu, "Sigma_np": v_Sig, "scen_np": v_scen,
             "bud_np": v_bud, "alpha": v_alpha,
             "mu": torch.tensor(v_mu, dtype=torch.float32, device=device),
@@ -547,7 +585,12 @@ def main():
             "budgets": torch.tensor(v_bud, dtype=torch.float32, device=device),
             "budgets_scaled": torch.tensor(v_bud_scaled, dtype=torch.float32, device=device),
             "A": torch.tensor(v_A_np, dtype=torch.float32, device=device),
-        })
+            "extra": v_extra,
+        }
+        if constraint_type == "enriched" and "constraint_scales" in v_extra:
+            inst_dict["constraint_scales"] = torch.tensor(
+                v_extra["constraint_scales"], dtype=torch.float32, device=device)
+        val_instances.append(inst_dict)
     log.info("val dataset: %d instances (seeds 1000-%d)", len(val_instances), 1000 + len(val_instances) - 1)
 
     # Batched val eval: one score-net forward pass per timestep for all instances
@@ -570,6 +613,7 @@ def main():
         constraint_type=constraint_type,
         num_sectors=pcfg.get("num_sectors", 10),
         constraint_scale=constraint_scale,
+        extra_constraints=_extra_constraints,
     ).to(device)
     _alphas_cumprod = _ref_sampler.alphas_cumprod.to(device)
     _post_var = _ref_sampler.posterior_variance.to(device)
@@ -626,7 +670,16 @@ def main():
             for i in range(n_inst):
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
-                if constraint_type == "variance_band":
+                if constraint_type == "enriched":
+                    w_i_detached = w_i.detach()
+                    c_i = _compute_constraints(w_i_detached, val_instances[i]["Sigma"],
+                                               val_instances[i]["scenarios"], val_instances[i]["alpha"],
+                                               "enriched", extra=val_instances[i]["extra"])
+                    if val_instances[i].get("constraint_scales") is not None:
+                        cs = val_instances[i]["constraint_scales"].unsqueeze(0)
+                        c_i = c_i * cs
+                    violation_i = c_i - val_instances[i]["budgets"].unsqueeze(0)
+                elif constraint_type == "variance_band":
                     c_var = variance_contributions_torch(w_i, val_instances[i]["Sigma"]) * constraint_scale
                     negated_c = torch.cat([-c_var, c_var], dim=1)
                     bud_s = val_instances[i]["budgets_scaled"]
@@ -665,6 +718,7 @@ def main():
                 w_i, val_instances[i]["Sigma"],
                 val_instances[i]["scenarios"], val_instances[i]["budgets"],
                 val_instances[i]["alpha"], constraint_type=constraint_type,
+                extra=val_instances[i].get("extra"),
             )
             all_metrics.append(m)
         result = {}
@@ -734,18 +788,29 @@ def main():
         _tpcfg = dict(PROBLEM_CONFIGS[args.size])
         _tpcfg["seed"] = si
         _tct = _tpcfg.pop("constraint_type", "shortfall")
-        t_mu, t_Sig, t_scen, t_bud, t_alpha = make_portfolio_problem(
-            constraint_type=_tct, **_tpcfg)
+        if constraint_type == "enriched":
+            t_mu, t_Sig, t_scen, t_bud, t_alpha, t_extra = \
+                make_enriched_portfolio_problem(
+                    sector_gamma=args.sector_gamma, **_tpcfg)
+        else:
+            t_mu, t_Sig, t_scen, t_bud, t_alpha = make_portfolio_problem(
+                constraint_type=_tct, **_tpcfg)
+            t_extra = {}
         A_np = build_dense_adjacency(t_Sig, top_k=20)
         t_bud_scaled = t_bud * constraint_scale if constraint_type in ("variance", "variance_band", "variance_sector") else t_bud
-        _all_train_instances.append({
+        inst = {
             "Sigma": torch.tensor(t_Sig, dtype=torch.float32, device=device),
             "scenarios": torch.tensor(t_scen, dtype=torch.float32, device=device),
             "budgets": torch.tensor(t_bud, dtype=torch.float32, device=device),
             "budgets_scaled": torch.tensor(t_bud_scaled, dtype=torch.float32, device=device),
             "alpha": t_alpha,
             "A": torch.tensor(A_np, dtype=torch.float32, device=device),
-        })
+            "extra": t_extra,
+        }
+        if constraint_type == "enriched" and "constraint_scales" in t_extra:
+            inst["constraint_scales"] = torch.tensor(
+                t_extra["constraint_scales"], dtype=torch.float32, device=device)
+        _all_train_instances.append(inst)
     log.info("pre-generated %d training instances (with correlation graphs)", len(_all_train_instances))
 
     _instances_per_rollout = args.num_rollouts_per_outer  # batch this many instances per rollout
@@ -802,7 +867,16 @@ def main():
             for i in range(n_inst):
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
-                if constraint_type == "variance_band":
+                if constraint_type == "enriched":
+                    w_i_detached = w_i.detach()
+                    c_i = _compute_constraints(w_i_detached, instances[i]["Sigma"],
+                                               instances[i]["scenarios"], instances[i]["alpha"],
+                                               "enriched", extra=instances[i]["extra"])
+                    if instances[i].get("constraint_scales") is not None:
+                        cs = instances[i]["constraint_scales"].unsqueeze(0)
+                        c_i = c_i * cs
+                    violation_i = c_i - instances[i]["budgets"].unsqueeze(0)
+                elif constraint_type == "variance_band":
                     c_var = variance_contributions_torch(w_i, instances[i]["Sigma"]) * constraint_scale
                     negated_c = torch.cat([-c_var, c_var], dim=1)
                     bud_s = instances[i]["budgets_scaled"]
@@ -843,6 +917,7 @@ def main():
             inst_data._port_risk_budgets = instances[i]["budgets"].cpu()
             inst_data._port_alpha = torch.tensor(float(instances[i]["alpha"]))
             inst_data._port_A = instances[i]["A"].cpu()
+            inst_data._port_extra = instances[i].get("extra", {})
             trainer.buffer.push_trajectory(
                 data=inst_data,
                 x_by_t=x_stack[:, lo:hi],

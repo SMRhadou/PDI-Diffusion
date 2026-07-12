@@ -43,6 +43,9 @@ PROBLEM_CONFIGS = {
     "small": dict(N=50, K_factors=5, R_scenarios=1000, gamma=1.0, seed=0),
     "medium": dict(N=100, K_factors=10, R_scenarios=500, gamma=1.5, seed=0),
     "large": dict(N=500, K_factors=50, R_scenarios=1000, gamma=2.0, seed=0),
+    "crypto": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
+                   structure="sectors", num_sectors=10,
+                   constraint_type="variance", budget_type="uniform"),
 }
 
 
@@ -61,16 +64,17 @@ def _make_batch(batch_size, N):
     return Batch.from_data_list(graphs)
 
 
-def _metrics(z, sampler, ctx, constraint_type="shortfall"):
+def _metrics(z, sampler, ctx, constraint_type="shortfall", raw_budgets=None):
     with torch.no_grad():
         w = sampler.z_to_portfolio_weights(z)
         if constraint_type in ("variance", "variance_sector"):
             risk = variance_contributions_torch(w, ctx.Sigma)
         else:
             risk = shortfall_contributions_torch(w, ctx.scenarios, ctx.alpha)
-        budgets = ctx.risk_budgets.unsqueeze(0)
+        bud = raw_budgets if raw_budgets is not None else ctx.risk_budgets
+        budgets = bud.unsqueeze(0)
         violation = (risk - budgets).clamp_min(0.0)
-        rel_violation = violation / budgets.clamp_min(1e-12)  # fractional over-budget
+        rel_violation = violation / budgets.abs().clamp_min(1e-12)
         ret = torch.matmul(ctx.scenarios, w.t()).mean(dim=0)
         Sx = torch.matmul(w, ctx.Sigma)
         var = (Sx * w).sum(dim=1)
@@ -79,9 +83,8 @@ def _metrics(z, sampler, ctx, constraint_type="shortfall"):
         ent = -(w * torch.log(w.clamp_min(1e-12))).sum(dim=1)
         # Option 2: E_x[c_j(x)] <= b_j (batch-mean feasibility)
         c_mean = risk.mean(dim=0)  # [N]
-        bud = ctx.risk_budgets
         opt2_vio = (c_mean - bud).clamp_min(0.0)
-        opt2_rel_vio = opt2_vio / bud.clamp_min(1e-12)
+        opt2_rel_vio = opt2_vio / bud.abs().clamp_min(1e-12)
         # Feasibility at multiple relative tolerances
         tols = {"strict": 1e-8}
         for pct in [1, 2, 5, 10, 20]:
@@ -161,7 +164,8 @@ def _run_one(ib: float, dual_step: float, use_dual: bool,
     ctx = sampler._build_energy_context(
         data=data, batch_size=B, num_nodes=N, device=device, dtype=torch.float32,
     )
-    m = _metrics(z, sampler, ctx, constraint_type=constraint_type)
+    raw_bud = torch.as_tensor(budgets, dtype=torch.float32, device=device)
+    m = _metrics(z, sampler, ctx, constraint_type=constraint_type, raw_budgets=raw_bud)
     m["wall_time_sec"] = wall
     m["ib"] = ib
     m["dual_step"] = dual_step if use_dual else 0.0

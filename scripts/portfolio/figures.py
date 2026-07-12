@@ -41,7 +41,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from pdi.diffusion.portfolio_energy_ddpm import (  # noqa: E402
-    PortfolioEnergyDDPM, make_portfolio_problem,
+    PortfolioEnergyDDPM, make_portfolio_problem, make_enriched_portfolio_problem,
     shortfall_contributions_np, shortfall_contributions_torch,
     variance_contributions_np, variance_contributions_torch,
 )
@@ -119,7 +119,6 @@ METHOD_LABELS = {
     "dps_net": "DPS (net)",
     "rejection": "DDPM\n+reject",
     "pd_langevin": "PDL",
-    "policy_net": "Policy\nnet",
     "ced_trained": "PDI-Net",
     "ced_ceiling_fixlam": r"PDI-MC ($\lambda^*$)",
     "ced_trained_fixlam": r"PDI-Net ($\lambda^*$)",
@@ -186,7 +185,8 @@ def _make_trained_score_estimator(score_net, alphas_cumprod, dense_A=None):
     return _fn
 
 
-def _pdm_sample(sampler, shape, device, data, Sigma, budgets, constraint_type):
+def _pdm_sample(sampler, shape, device, data, Sigma, budgets, constraint_type,
+                extra=None, pdm_proj_lr=0.1):
     """PDM: run reverse process, project x_t onto feasible set after each step."""
     B, _, N, _ = shape
     x_t = torch.randn(shape, device=device, dtype=torch.float32)
@@ -208,11 +208,13 @@ def _pdm_sample(sampler, shape, device, data, Sigma, budgets, constraint_type):
                 x_t = mean + torch.sqrt(var) * torch.randn_like(x_t)
             else:
                 x_t = mean
-            # Project x_t onto feasible set
-            w = sampler.z_to_portfolio_weights(x_t)
+        with torch.enable_grad():
+            w = sampler.z_to_portfolio_weights(x_t.detach())
+            _proj_iters = 100 if constraint_type == "enriched" else 1
             w_proj = bl.project_to_feasible(w, Sigma, None, 0.0, budgets,
                                              constraint_type=constraint_type,
-                                             num_iters=1)
+                                             num_iters=_proj_iters, lr=pdm_proj_lr,
+                                             extra=extra)
             z_proj = torch.log(w_proj.clamp_min(1e-12))
             z_proj = z_proj - z_proj.mean(dim=-1, keepdim=True)
             x_t = z_proj.view(B, 1, N, 1)
@@ -224,7 +226,6 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                          ced_ckpt: Path | None = None,
                          hidden: int = 256, num_layers: int = 4,
                          problem_seed: int | None = None,
-                         policy_net_pretrained=None,
                          include_mc_variants: bool = False,
                          mc_only: bool = False,
                          beta_schedule: str = "cosine",
@@ -239,31 +240,47 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                          tagconv_K: int = 2,
                          mc_lambda_study: bool = False,
                          dps_scale: float = 1.0,
-                         dps_sweep: str = None) -> dict:
+                         dps_sweep: str = None,
+                         pdm_proj_lr: float = 0.1) -> dict:
     """Run all methods and return a dict of {method_name: weights_tensor [B, N]}.
 
     Args:
         problem_seed: override the problem-generation seed (for multi-instance sweeps).
-        policy_net_pretrained: if provided (from amortized training), skip per-instance
-            policy-net training and just run inference with this net.
     """
     pcfg = dict(PROBLEM_CONFIGS[size])
     if problem_seed is not None:
         pcfg["seed"] = int(problem_seed)
     N = pcfg["N"]
     constraint_type = pcfg.pop("constraint_type", "shortfall")
-    mu_np, Sigma_np, scen_np, bud_np, alpha_np = make_portfolio_problem(
-        constraint_type=constraint_type, **pcfg)
-    if constraint_type in ("variance", "variance_band", "variance_sector"):
-        c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+    _extra_constraints = {}
+    if constraint_type == "enriched":
+        sector_gamma = pcfg.pop("sector_gamma", 1.5)
+        mu_np, Sigma_np, scen_np, bud_np, alpha_np, _extra_constraints = \
+            make_enriched_portfolio_problem(
+                N=pcfg["N"], K_factors=pcfg.get("K_factors", 50),
+                R_scenarios=pcfg.get("R_scenarios", 1000),
+                gamma=pcfg.get("gamma", 3.0), sector_gamma=sector_gamma,
+                seed=pcfg.get("seed", 0), structure=pcfg.get("structure", "sectors"),
+                num_sectors=pcfg.get("num_sectors", 10),
+                budget_type=pcfg.get("budget_type", "uniform"),
+            )
         ret_mean = abs(scen_np.mean(axis=0)).mean()
         _obj_scale = 1.0 / max(ret_mean, 1e-12)
-        _constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
-        bud_scaled = bud_np * _constraint_scale
-    else:
-        _obj_scale = 1.0
         _constraint_scale = 1.0
         bud_scaled = bud_np
+    else:
+        mu_np, Sigma_np, scen_np, bud_np, alpha_np = make_portfolio_problem(
+            constraint_type=constraint_type, **pcfg)
+        if constraint_type in ("variance", "variance_band", "variance_sector"):
+            c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma_np).mean()
+            ret_mean = abs(scen_np.mean(axis=0)).mean()
+            _obj_scale = 1.0 / max(ret_mean, 1e-12)
+            _constraint_scale = 1.0 / max(c_eq_mean, 1e-12)
+            bud_scaled = bud_np * _constraint_scale
+        else:
+            _obj_scale = 1.0
+            _constraint_scale = 1.0
+            bud_scaled = bud_np
 
     mu = torch.tensor(mu_np, dtype=torch.float32, device=device)
     Sigma = torch.tensor(Sigma_np, dtype=torch.float32, device=device)
@@ -289,6 +306,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             constraint_type=constraint_type,
             num_sectors=pcfg.get("num_sectors", 10),
             constraint_scale=_constraint_scale,
+            extra_constraints=_extra_constraints,
         ).to(device)
 
     shape = (B, 1, N, 1)
@@ -301,9 +319,14 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
     mu_u = bl.markowitz_unconstrained(mu_np, Sigma_np, risk_aversion=5.0)
     weights["markowitz_unconstrained"] = torch.tensor(mu_u, dtype=torch.float32,
                                                         device=device).unsqueeze(0).expand(B, -1).contiguous()
-    bud_for_mkz = bud_np[:N] if constraint_type == "dual" else bud_np
-    mu_c = bl.markowitz_constrained(mu_np, Sigma_np, bud_for_mkz, risk_aversion=5.0,
-                                     constraint_type=constraint_type)
+    if constraint_type == "enriched":
+        bud_for_mkz = bud_np[:N]
+        mu_c = bl.markowitz_constrained(mu_np, Sigma_np, bud_for_mkz, risk_aversion=5.0,
+                                         constraint_type="variance")
+    else:
+        bud_for_mkz = bud_np[:N] if constraint_type == "dual" else bud_np
+        mu_c = bl.markowitz_constrained(mu_np, Sigma_np, bud_for_mkz, risk_aversion=5.0,
+                                         constraint_type=constraint_type)
     weights["markowitz_constrained"] = torch.tensor(mu_c, dtype=torch.float32,
                                                       device=device).unsqueeze(0).expand(B, -1).contiguous()
 
@@ -431,7 +454,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
 
     if include_mc_variants:
         import types as _types
-        B_var = min(B, 512)
+        B_var = B
         shape_var = (B_var, 1, N, 1)
         data_var = _make_batch(B_var, N).to(device)
 
@@ -447,8 +470,11 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         if constraint_type != "dual":
             torch.manual_seed(seed)
             s_pdm = _mk_sampler(ib, 1e-12, lam0_override=0.0)
+            _pdm_bud = torch.tensor(bud_np, dtype=torch.float32, device=device) if constraint_type == "enriched" else budgets
             z_pdm = _pdm_sample(s_pdm, shape_var, device, data_var,
-                                 Sigma, budgets, constraint_type)
+                                 Sigma, _pdm_bud, constraint_type,
+                                 extra=_extra_constraints if constraint_type == "enriched" else None,
+                                 pdm_proj_lr=pdm_proj_lr)
             weights["pdm_mc"] = s_pdm.z_to_portfolio_weights(z_pdm).detach()
 
         # DPS (MC) = unconstrained MC + gradient guidance through x_t
@@ -457,15 +483,21 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         _N = N
         _Sig = Sigma
         _scen = scenarios
-        _bud = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+        if constraint_type == "enriched":
+            _dps_scales = torch.tensor(_extra_constraints["constraint_scales"], dtype=torch.float32, device=device)
+            _bud = torch.tensor(bud_np * _extra_constraints["constraint_scales"], dtype=torch.float32, device=device)
+        else:
+            _dps_scales = None
+            _bud = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
         _alpha_val = float(alpha_np)
         _cs_dps = _constraint_scale
         _ct = constraint_type
+        _extra_dps = _extra_constraints
         _dps_alphas_cumprod = s_dps.alphas_cumprod
         def _dps_correct(self, x_t, t, x0_pred, eps_pred,
                          _s=dps_scale, _sc=_scen, _b=_bud, _a=_alpha_val,
                          _n=_N, _sig=_Sig, _ctype=_ct, _ac=_dps_alphas_cumprod,
-                         _cscale=_cs_dps):
+                         _cscale=_cs_dps, _ext=_extra_dps, _dscales=_dps_scales):
             B_loc = x_t.shape[0]
             x_t_g = x_t.detach().requires_grad_(True)
             alpha_bar = _ac[t].view(-1, 1, 1, 1)
@@ -473,17 +505,11 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             sqrt_1mab = torch.sqrt((1.0 - alpha_bar).clamp_min(1e-12))
             x0_tw = (x_t_g - sqrt_1mab * eps_pred.detach()) / sqrt_ab
             w_g = torch.softmax(x0_tw[:, 0, :, 0], dim=-1)
-            if _ctype == "shortfall":
-                c_g = shortfall_contributions_torch(w_g, _sc, _a)
-            elif _ctype == "variance_band":
-                c_var = variance_contributions_torch(w_g, _sig) * _cscale
-                c_g = torch.cat([c_var, -c_var], dim=-1)
-            elif _ctype == "dual":
-                c_var = variance_contributions_torch(w_g, _sig)
-                c_short = shortfall_contributions_torch(w_g, _sc, _a)
-                c_g = torch.cat([c_var, c_short], dim=-1)
-            else:
-                c_g = variance_contributions_torch(w_g, _sig) * _cscale
+            c_g = bl._compute_constraints(w_g, _sig, _sc, _a, _ctype, extra=_ext)
+            if _dscales is not None:
+                c_g = c_g * _dscales.unsqueeze(0)
+            elif _cscale != 1.0:
+                c_g = c_g * _cscale
             loss = ((c_g - _b.unsqueeze(0)).clamp_min(0.0) ** 2).sum()
             grad_xt = torch.autograd.grad(loss, x_t_g)[0]
             x_t_corrected = (x_t - _s * grad_xt).detach()
@@ -511,17 +537,23 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         # PD-Langevin (per-sample lambda; ib removed)
         _pdl_plr = pdl_primal_lr
         _pdl_dlr = pdl_dual_lr
-        _bud_pdl = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+        if constraint_type == "enriched":
+            _bud_pdl = torch.tensor(bud_np, dtype=torch.float32, device=device)
+            _pdl_cs = 1.0
+            _pdl_extra = _extra_constraints
+        else:
+            _bud_pdl = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+            _pdl_cs = _constraint_scale
+            _pdl_extra = None
         w_pdl, _ = bl.pd_langevin(mu, Sigma, scenarios, _bud_pdl, alpha=float(alpha_np), B=B,
                                     num_iters=500, primal_lr=_pdl_plr,
                                     dual_lr=_pdl_dlr,
                                     device=device, seed=seed,
                                     constraint_type=constraint_type,
                                     objective_scale=_obj_scale,
-                                    constraint_scale=_constraint_scale)
+                                    constraint_scale=_pdl_cs,
+                                    extra=_pdl_extra)
         weights["pd_langevin"] = w_pdl.detach()
-
-        pass  # policy_net skipped
 
     # CED trained + net-score variants (all require trained score net)
     if ced_ckpt is not None and Path(ced_ckpt).exists():
@@ -603,7 +635,8 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             s_pdm_net = _mk_sampler(ib, 1e-12, lam0_override=0.0)
             s_pdm_net._estimate_score = _types_net.MethodType(trained_score_fn, s_pdm_net)
             z_pdm_net = _pdm_sample(s_pdm_net, shape, device, data,
-                                     Sigma, budgets, constraint_type)
+                                     Sigma, budgets, constraint_type,
+                                     pdm_proj_lr=pdm_proj_lr)
             weights["pdm_net"] = s_pdm_net.z_to_portfolio_weights(z_pdm_net).detach()
 
         # DPS (net) = trained net + gradient guidance, lambda=0
@@ -702,13 +735,16 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             z_pl = s_pl.sample(shape=shape, device=device, data=data)
             weights[_lbl] = s_pl.z_to_portfolio_weights(z_pl).detach()
 
+    problem = {
+        "mu": mu_np, "Sigma": Sigma_np, "scenarios": scen_np,
+        "budgets": bud_np, "alpha": float(alpha_np),
+        "constraint_type": constraint_type,
+    }
+    if _extra_constraints:
+        problem["extra"] = _extra_constraints
     return {
         "weights": weights,
-        "problem": {
-            "mu": mu_np, "Sigma": Sigma_np, "scenarios": scen_np,
-            "budgets": bud_np, "alpha": float(alpha_np),
-            "constraint_type": constraint_type,
-        },
+        "problem": problem,
         "lambda_traces": lambda_traces,
     }
 
@@ -719,7 +755,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
 
 def _cache_key(args) -> str:
     return (f"{args.size}_K{args.num_instances}_ib{args.ib:g}_ds{args.dual_step:g}"
-            f"_T{args.T}_B{args.B}_mc{args.K}_pi{args.policy_iters}_seed{args.seed}")
+            f"_T{args.T}_B{args.B}_mc{args.K}_seed{args.seed}")
 
 
 def _cache_path(args) -> Path:
@@ -751,7 +787,7 @@ def _load_cache(path: Path, device) -> list | None:
 
 
 # ---------------------------------------------------------------
-# Multi-instance collection (amortized policy_net)
+# Multi-instance collection
 # ---------------------------------------------------------------
 
 def collect_multi_instance(size: str, num_instances: int, ib: float,
@@ -759,9 +795,7 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
                             seed: int, device,
                             ced_ckpt: Path | None = None,
                             hidden: int = 256, num_layers: int = 4,
-                            policy_iters: int = 4000,
                             include_mc_variants: bool = False,
-                            policy_net_pretrained=None,
                             mc_only: bool = False,
                             beta_schedule: str = "cosine",
                             pdl_primal_lr: float = 0.01,
@@ -775,45 +809,11 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
                             backbone: str = "mlp",
                             tagconv_K: int = 2,
                             dps_scale: float = 1.0,
-                            dps_sweep: str = None) -> list:
-    """Collect weights for K instances. Trains policy_net amortized ONCE
-    (or reuses one passed in via ``policy_net_pretrained``)."""
+                            dps_sweep: str = None,
+                            pdm_proj_lr: float = 0.1) -> list:
+    """Collect weights for K instances."""
     pcfg = dict(PROBLEM_CONFIGS[size])
     N = pcfg["N"]
-
-    # Build instance tensors upfront (needed for amortized policy training)
-    instances_for_policy = []
-    for s in range(num_instances):
-        pcfg_s = dict(pcfg); pcfg_s["seed"] = s
-        mu_np, Sigma_np, scen_np, bud_np, alpha_np = make_portfolio_problem(**pcfg_s)
-        instances_for_policy.append({
-            "mu": torch.tensor(mu_np, dtype=torch.float32, device=device),
-            "Sigma": torch.tensor(Sigma_np, dtype=torch.float32, device=device),
-            "scenarios": torch.tensor(scen_np, dtype=torch.float32, device=device),
-            "budgets": torch.tensor(bud_np, dtype=torch.float32, device=device),
-            "alpha": alpha_np,
-        })
-
-    if mc_only:
-        policy_net = None
-        print(f"[multi] mc_only=True; skipping policy_net entirely")
-    elif policy_net_pretrained is None:
-        print(f"[multi] training amortized policy_net on {num_instances} instances, "
-              f"{policy_iters} iters...")
-        t0 = time.time()
-        policy_net, pn_info = bl.train_policy_net_amortized(
-            instances=instances_for_policy, B=B, num_iters=policy_iters,
-            primal_lr=1e-3, dual_lr=100.0, inverse_beta=100.0, noise_scale=0.3,
-            shared_lambda=True, device=device, seed=42,
-            hidden=hidden, num_layers=num_layers,
-            log_every=max(1, policy_iters // 8),
-        )
-        print(f"[multi] policy_net done in {time.time()-t0:.1f}s  "
-              f"lam_mean={pn_info['final_lambda_mean']:.3g}  "
-              f"lam_max={pn_info['final_lambda_max']:.3g}")
-    else:
-        policy_net = policy_net_pretrained
-        print(f"[multi] reusing pretrained policy_net (sweep mode)")
 
     data_list = []
     for s in range(num_instances):
@@ -822,7 +822,7 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
             size=size, ib=ib, dual_step=dual_step, T=T, B=B, K=K,
             seed=seed, device=device, ced_ckpt=ced_ckpt,
             hidden=hidden, num_layers=num_layers,
-            problem_seed=s, policy_net_pretrained=policy_net,
+            problem_seed=s,
             include_mc_variants=include_mc_variants,
             mc_only=mc_only,
             beta_schedule=beta_schedule,
@@ -833,6 +833,7 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
             mc_lambda_study=mc_lambda_study,
             backbone=backbone, tagconv_K=tagconv_K,
             dps_scale=dps_scale, dps_sweep=dps_sweep,
+            pdm_proj_lr=pdm_proj_lr,
         )
         d["problem_seed"] = s
         data_list.append(d)
@@ -858,6 +859,25 @@ def _compute_contributions_np(w, problem):
         c_var = variance_contributions_np(w, problem["Sigma"])
         c_short = shortfall_contributions_np(w, problem["scenarios"], problem["alpha"])
         return np.concatenate([c_var, c_short], axis=-1)
+    elif ct == "enriched":
+        extra = problem["extra"]
+        N = w.shape[1]
+        S = len(extra["sector_upper"])
+        c_var = variance_contributions_np(w, problem["Sigma"])
+        B = w.shape[0]
+        sector_ids = extra["sector_ids"]
+        exposure = np.zeros((B, S))
+        for s in range(S):
+            exposure[:, s] = w[:, sector_ids == s].sum(axis=1)
+        upper_res = exposure - extra["sector_upper"][None, :]
+        lower_res = extra["sector_lower"][None, :] - exposure
+        stress_port = w @ extra["stress_returns"].T
+        excess_loss = np.maximum(-stress_port - extra["stress_limits"][None, :], 0.0)
+        stress_res = excess_loss - extra["stress_eps"][None, :]
+        ent = -(w * np.log(np.clip(w, 1e-12, None))).sum(axis=1, keepdims=True)
+        neff_val = np.exp(ent)
+        neff_res = neff_val - extra.get("neff_target", 500.0)
+        return np.concatenate([c_var, upper_res, lower_res, stress_res, neff_res], axis=-1)
     else:
         raise ValueError(f"Unknown constraint_type: {ct}")
 
@@ -905,6 +925,36 @@ def _per_instance_metrics(weights_dict, problem, methods, eps_feas=0.1):
             Neff=float(Neff.mean()),
             top1_distinct=top1_distinct, top1_entropy=top1_entropy,
         )
+        if problem.get("constraint_type") == "enriched":
+            extra = problem["extra"]
+            n_var = N
+            S = len(extra["sector_upper"])
+            M = len(extra["stress_limits"])
+            var_c_mean = c_mean[:n_var]
+            var_bud = bud[:n_var]
+            metrics[m]["var_csat"] = float((var_c_mean <= var_bud + 1e-8).mean())
+            metrics[m]["var_vio"] = float(np.maximum(var_c_mean - var_bud, 0.0).mean())
+            var_bud_scale = max(abs(var_bud).mean(), 1e-12)
+            metrics[m]["var_rvio"] = float(np.maximum(var_c_mean - var_bud, 0.0).mean() / var_bud_scale)
+            sec_c_mean = c_mean[n_var:n_var + 2 * S]
+            sec_bud = bud[n_var:n_var + 2 * S]
+            metrics[m]["sector_csat"] = float((sec_c_mean <= sec_bud + 1e-8).mean())
+            metrics[m]["sector_vio"] = float(np.maximum(sec_c_mean - sec_bud, 0.0).mean())
+            sec_scale = max(abs(extra["sector_upper"]).mean(), 1e-12)
+            metrics[m]["sector_rvio"] = float(np.maximum(sec_c_mean - sec_bud, 0.0).mean() / sec_scale)
+            str_end = n_var + 2 * S + M
+            str_c_mean = c_mean[n_var + 2 * S:str_end]
+            str_bud = bud[n_var + 2 * S:str_end]
+            metrics[m]["stress_csat"] = float((str_c_mean <= str_bud + 1e-8).mean())
+            metrics[m]["stress_vio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean())
+            str_scale = max(abs(extra["stress_eps"]).mean(), 1e-12)
+            metrics[m]["stress_rvio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean() / str_scale)
+            neff_c_mean = c_mean[str_end:]
+            neff_bud = bud[str_end:]
+            metrics[m]["neff_csat"] = float((neff_c_mean <= neff_bud + 1e-8).all())
+            neff_target = extra.get("neff_target", 60.0)
+            metrics[m]["neff_vio"] = float(np.maximum(neff_c_mean - neff_bud, 0.0).mean())
+            metrics[m]["neff_rvio"] = float(np.maximum(neff_c_mean - neff_bud, 0.0).mean() / neff_target)
     return metrics
 
 
@@ -985,39 +1035,132 @@ def plot_comparison_bars(data, out_dir, methods=PAPER_METHODS, eps_feas=0.1):
             }.items()
         }
 
+    # Check if enriched
+    is_enriched = data_list[0]["problem"].get("constraint_type") == "enriched"
+
+    if is_enriched:
+        var_csat = _stack("var_csat")
+        sector_csat = _stack("sector_csat")
+        stress_csat = _stack("stress_csat")
+        neff_csat_vals = _stack("neff_csat")
+        var_vio = _stack("var_vio")
+        sector_vio = _stack("sector_vio")
+        stress_vio = _stack("stress_vio")
+        neff_vio_vals = _stack("neff_vio")
+        var_rvio = _stack("var_rvio")
+        sector_rvio = _stack("sector_rvio")
+        stress_rvio = _stack("stress_rvio")
+        neff_rvio = _stack("neff_rvio")
+
     # Write LaTeX table
-    lines = [
-        r"\begin{table}[t]",
-        r"\centering",
-        r"\caption{Portfolio baseline comparison ($N=" + str(N) + r"$)}",
-        r"\label{tab:portfolio_baselines}",
-        r"\begin{tabular}{l c c c c c c}",
-        r"\toprule",
-        r"Method & Return & Feasibility & Mean Viol. & $N_{\mathrm{eff}}$ & Entropy & $|\mathrm{top1}|$ \\",
-        r"\midrule",
-    ]
     show_std = K > 1
-    for m in methods_found:
-        lbl = METHOD_LABELS.get(m, m).replace("\n", " ")
-        r_m, r_s = float(ret[m].mean()), float(ret[m].std())
-        f_m, f_s = float(o2csat[m].mean()), float(o2csat[m].std())
-        v_m, v_s = float(vio_mean[m].mean()), float(vio_mean[m].std())
-        ne_m, ne_s = float(neff[m].mean()), float(neff[m].std())
-        h_m = float(top1H[m].mean())
-        td_m = int(top1_distinct[m].mean())
-        if show_std:
+
+    def _enriched_table(use_rvio=False):
+        tag = "rvio" if use_rvio else "baselines"
+        vio_label = "RVio" if use_rvio else "Vio"
+        lines_e = [
+            r"\begin{table}[t]",
+            r"\centering",
+            r"\caption{Enriched portfolio baseline comparison ($N=" + str(N) + r"$)}",
+            r"\label{tab:portfolio_enriched_" + tag + r"}",
+            r"\resizebox{\textwidth}{!}{%",
+            r"\begin{tabular}{l c c c c c c c c c c c c c c}",
+            r"\toprule",
+            r"Method & Return & Var\% & Sec\% & Str\% & Neff\% & Feas\%"
+            r" & Var " + vio_label + r" & Sec " + vio_label + r" & Str " + vio_label + r" & Neff " + vio_label
+            + r" & $N_{\mathrm{eff}}$ & Entropy & $|\mathrm{top1}|$ \\",
+            r"\midrule",
+        ]
+        for m in methods_found:
+            lbl = METHOD_LABELS.get(m, m).replace("\n", " ")
+            r_m, r_s = float(ret[m].mean()), float(ret[m].std())
+            f_m, f_s = float(o2csat[m].mean()), float(o2csat[m].std())
+            ne_m, ne_s = float(neff[m].mean()), float(neff[m].std())
+            h_m, h_s = float(top1H[m].mean()), float(top1H[m].std())
+            td_m, td_s = float(top1_distinct[m].mean()), float(top1_distinct[m].std())
+            vc_m, vc_s = float(var_csat[m].mean()), float(var_csat[m].std())
+            sc_m, sc_s = float(sector_csat[m].mean()), float(sector_csat[m].std())
+            st_m, st_s = float(stress_csat[m].mean()), float(stress_csat[m].std())
+            nc_m, nc_s = float(neff_csat_vals[m].mean()), float(neff_csat_vals[m].std())
+            if use_rvio:
+                v1_m, v1_s = float(var_rvio[m].mean()), float(var_rvio[m].std())
+                v2_m, v2_s = float(sector_rvio[m].mean()), float(sector_rvio[m].std())
+                v3_m, v3_s = float(stress_rvio[m].mean()), float(stress_rvio[m].std())
+                v4_m, v4_s = float(neff_rvio[m].mean()), float(neff_rvio[m].std())
+                vfmt = lambda vm, vs: f"{vm:.3f}$\\pm${vs:.3f}" if show_std else f"{vm:.3f}"
+            else:
+                v1_m, v1_s = float(var_vio[m].mean()), float(var_vio[m].std())
+                v2_m, v2_s = float(sector_vio[m].mean()), float(sector_vio[m].std())
+                v3_m, v3_s = float(stress_vio[m].mean()), float(stress_vio[m].std())
+                v4_m, v4_s = float(neff_vio_vals[m].mean()), float(neff_vio_vals[m].std())
+                vfmt = lambda vm, vs: f"{vm:.2e}$\\pm${vs:.2e}" if show_std else f"{vm:.2e}"
+            if show_std:
+                lines_e.append(
+                    f"  {lbl} & {r_m:.3f}$\\pm${r_s:.3f}"
+                    f" & {vc_m:.2f}$\\pm${vc_s:.2f}"
+                    f" & {sc_m:.2f}$\\pm${sc_s:.2f}"
+                    f" & {st_m:.2f}$\\pm${st_s:.2f}"
+                    f" & {nc_m:.2f}$\\pm${nc_s:.2f}"
+                    f" & {f_m:.2f}$\\pm${f_s:.2f}"
+                    f" & {vfmt(v1_m, v1_s)}"
+                    f" & {vfmt(v2_m, v2_s)}"
+                    f" & {vfmt(v3_m, v3_s)}"
+                    f" & {vfmt(v4_m, v4_s)}"
+                    f" & {ne_m:.1f}$\\pm${ne_s:.1f}"
+                    f" & {h_m:.2f}$\\pm${h_s:.2f}"
+                    f" & {td_m:.0f}$\\pm${td_s:.0f} \\\\")
+            else:
+                lines_e.append(
+                    f"  {lbl} & {r_m:.3f}"
+                    f" & {vc_m:.2f} & {sc_m:.2f} & {st_m:.2f} & {nc_m:.2f} & {f_m:.2f}"
+                    f" & {vfmt(v1_m, v1_s)} & {vfmt(v2_m, v2_s)}"
+                    f" & {vfmt(v3_m, v3_s)} & {vfmt(v4_m, v4_s)}"
+                    f" & {ne_m:.1f} & {h_m:.2f} & {td_m:.0f} \\\\")
+        lines_e += [r"\bottomrule", r"\end{tabular}}", r"\end{table}"]
+        return lines_e
+
+    if is_enriched:
+        # Raw violation table
+        lines = _enriched_table(use_rvio=False)
+        tex_path = out_dir / "table_baselines.tex"
+        tex_path.write_text("\n".join(lines) + "\n")
+        print(f"saved {tex_path}")
+        # Relative violation table
+        lines_rv = _enriched_table(use_rvio=True)
+        rv_path = out_dir / "table_rvio.tex"
+        rv_path.write_text("\n".join(lines_rv) + "\n")
+        print(f"saved {rv_path}")
+    else:
+        lines = [
+            r"\begin{table}[t]",
+            r"\centering",
+            r"\caption{Portfolio baseline comparison ($N=" + str(N) + r"$)}",
+            r"\label{tab:portfolio_baselines}",
+            r"\begin{tabular}{l c c c c c c}",
+            r"\toprule",
+            r"Method & Return & Feasibility & Mean Viol. & $N_{\mathrm{eff}}$ & Entropy & $|\mathrm{top1}|$ \\",
+            r"\midrule",
+        ]
+        for m in methods_found:
+            lbl = METHOD_LABELS.get(m, m).replace("\n", " ")
+            r_m, r_s = float(ret[m].mean()), float(ret[m].std())
+            f_m, f_s = float(o2csat[m].mean()), float(o2csat[m].std())
+            ne_m, ne_s = float(neff[m].mean()), float(neff[m].std())
+            h_m, h_s = float(top1H[m].mean()), float(top1H[m].std())
+            td_m, td_s = float(top1_distinct[m].mean()), float(top1_distinct[m].std())
+            v_m, v_s = float(vio_mean[m].mean()), float(vio_mean[m].std())
             lines.append(
                 f"  {lbl} & {r_m:.3f}$\\pm${r_s:.3f}"
                 f" & {f_m:.2f}$\\pm${f_s:.2f}"
-                f" & {v_m:.2e}"
+                f" & {v_m:.2e}$\\pm${v_s:.2e}"
                 f" & {ne_m:.1f}$\\pm${ne_s:.1f}"
-                f" & {h_m:.2f} & {td_m} \\\\")
-        else:
-            lines.append(f"  {lbl} & {r_m:.3f} & {f_m:.2f} & {v_m:.2e} & {ne_m:.1f} & {h_m:.2f} & {td_m} \\\\")
-    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
-    tex_path = out_dir / "table_baselines.tex"
-    tex_path.write_text("\n".join(lines) + "\n")
-    print(f"saved {tex_path}")
+                f" & {h_m:.2f}$\\pm${h_s:.2f}"
+                f" & {td_m:.0f}$\\pm${td_s:.0f} \\\\")
+    if not is_enriched:
+        lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+        tex_path = out_dir / "table_baselines.tex"
+        tex_path.write_text("\n".join(lines) + "\n")
+        print(f"saved {tex_path}")
 
     return agg
 
@@ -2446,10 +2589,7 @@ def main():
     parser.add_argument("--label", type=str, default="paper_figures")
     parser.add_argument("--eps-feas", type=float, default=0.1)
     parser.add_argument("--num-instances", type=int, default=1,
-                        help="Number of problem instances (seeds 0..K-1). K>1 trains "
-                              "an amortized policy_net across all instances and aggregates figures.")
-    parser.add_argument("--policy-iters", type=int, default=4000,
-                        help="Amortized policy_net training iters (only used when --num-instances > 1).")
+                        help="Number of problem instances (seeds 0..K-1).")
     parser.add_argument("--trace", action="store_true",
                         help="Trace CED reverse-SDE + PD-Langevin to produce sample/dual "
                               "evolution figures (figs 4 & 5).")
@@ -2471,10 +2611,12 @@ def main():
                         help="DPS guidance scale.")
     parser.add_argument("--dps-sweep", type=str, default=None,
                         help="Comma-separated DPS scale values for sweep.")
+    parser.add_argument("--pdm-proj-lr", type=float, default=0.1,
+                        help="PDM projection learning rate.")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="Directory for cached data_list (default: outputs/portfolio/figures_cache/). "
                               "Cache key is derived from (size, num_instances, ib, dual_step, T, B, K, "
-                              "policy_iters, seed). Figures always regenerate.")
+                              "seed). Figures always regenerate.")
     parser.add_argument("--force-recompute", action="store_true",
                         help="Ignore any cached weights and recompute from scratch.")
     parser.add_argument("--include-mc-variants", action="store_true",
@@ -2482,18 +2624,16 @@ def main():
                               "calls per instance, ~3x slower). Default off.")
     parser.add_argument("--ib-grid", type=str, default=None,
                         help="Comma-separated ib values for sweep mode (e.g. '0.03,0.1,0.3'). "
-                              "If set together with --ds-grid, runs each (ib, ds) pair, sharing "
-                              "the trained policy_net, writing per-config caches and figures.")
+                              "If set together with --ds-grid, runs each (ib, ds) pair, "
+                              "writing per-config caches and figures.")
     parser.add_argument("--ds-grid", type=str, default=None,
                         help="Comma-separated dual_step values for sweep mode.")
     parser.add_argument("--parallel", type=int, default=1,
                         help="In sweep mode, run this many (ib, ds) configs concurrently as "
                               "subprocesses (each gets its own CUDA context).")
-    parser.add_argument("--policy-ckpt", type=str, default=None,
-                        help="Path to saved policy_net state_dict; if present, skip training.")
     parser.add_argument("--mc-only", action="store_true",
-                        help="Run only mc_teacher + analytical baselines. Skip policy_net "
-                              "and pd_langevin. Useful for fast (ib, ds) sweeps focused on the MC sampler.")
+                        help="Run only mc_teacher + analytical baselines. Skip pd_langevin. "
+                              "Useful for fast (ib, ds) sweeps focused on the MC sampler.")
     parser.add_argument("--mc-lambda-study", action="store_true",
                         help="Run MC ceiling lambda study (fixed/warm-start variants + uniform sweep).")
     parser.add_argument("--schedule-sweep", action="store_true",
@@ -2504,10 +2644,23 @@ def main():
                         help="Skip all baselines, only run study flags.")
     parser.add_argument("--gamma", type=float, default=None,
                         help="Override budget tightness gamma for the chosen --size preset.")
+    parser.add_argument("--budget-type", type=str, default=None,
+                        choices=["proportional", "uniform"],
+                        help="Override budget type for the chosen --size preset.")
+    parser.add_argument("--constraint-type", type=str, default=None,
+                        help="Override constraint type (e.g. 'enriched').")
+    parser.add_argument("--sector-gamma", type=float, default=1.5,
+                        help="Sector exposure tightness for enriched constraints.")
     args = parser.parse_args()
 
     if args.gamma is not None:
         PROBLEM_CONFIGS[args.size]["gamma"] = args.gamma
+    if args.budget_type is not None:
+        PROBLEM_CONFIGS[args.size]["budget_type"] = args.budget_type
+    if args.constraint_type is not None:
+        PROBLEM_CONFIGS[args.size]["constraint_type"] = args.constraint_type
+    if args.constraint_type == "enriched":
+        PROBLEM_CONFIGS[args.size]["sector_gamma"] = args.sector_gamma
 
     # Auto-detect architecture params from checkpoint's summary.json
     if args.ced_ckpt is not None:
@@ -2560,52 +2713,6 @@ def main():
         )
         cache_root.mkdir(parents=True, exist_ok=True)
 
-        if args.mc_only:
-            print(f"[sweep] mc_only=True; skipping policy_net training/loading.")
-            policy_net = None
-        else:
-            # Train (or load) the amortized policy_net ONCE; cache to disk.
-            policy_ckpt = cache_root / (
-                f"policy_{args.size}_K{args.num_instances}_pi{args.policy_iters}_B{args.B}.pt"
-            )
-            if args.policy_ckpt is None and policy_ckpt.exists():
-                print(f"[sweep] reusing cached policy_net at {policy_ckpt}")
-                args.policy_ckpt = str(policy_ckpt)
-
-            if args.policy_ckpt is None:
-                instances_for_policy = []
-                for s in range(args.num_instances):
-                    pcfg_s = dict(PROBLEM_CONFIGS[args.size]); pcfg_s["seed"] = s
-                    mu_np, Sigma_np, scen_np, bud_np, alpha = make_portfolio_problem(**pcfg_s)
-                    instances_for_policy.append({
-                        "mu": torch.tensor(mu_np, dtype=torch.float32, device=device),
-                        "Sigma": torch.tensor(Sigma_np, dtype=torch.float32, device=device),
-                        "scenarios": torch.tensor(scen_np, dtype=torch.float32, device=device),
-                        "budgets": torch.tensor(bud_np, dtype=torch.float32, device=device),
-                        "alpha": alpha,
-                    })
-                print(f"[sweep] training amortized policy_net once for the family...")
-                t0 = time.time()
-                policy_net, _ = bl.train_policy_net_amortized(
-                    instances=instances_for_policy, B=args.B, num_iters=args.policy_iters,
-                    primal_lr=1e-3, dual_lr=100.0, inverse_beta=100.0, noise_scale=0.3,
-                    shared_lambda=True, device=device, seed=42,
-                    hidden=args.hidden, num_layers=args.num_layers,
-                    log_every=max(1, args.policy_iters // 4),
-                )
-                print(f"[sweep] policy_net done in {time.time()-t0:.1f}s")
-                torch.save(policy_net.state_dict(), policy_ckpt)
-                print(f"[sweep] saved policy ckpt to {policy_ckpt}")
-                args.policy_ckpt = str(policy_ckpt)
-            else:
-                ckpt_state = torch.load(args.policy_ckpt, map_location=device, weights_only=False)
-                N = PROBLEM_CONFIGS[args.size]["N"]
-                policy_net = bl.PortfolioPolicyNet(N=N, hidden=args.hidden,
-                                                     num_layers=args.num_layers).to(device)
-                policy_net.load_state_dict(ckpt_state)
-                policy_net.eval()
-                print(f"[sweep] loaded policy_net from {args.policy_ckpt}")
-
         # Parallel sweep: launch each config as a subprocess
         if args.parallel > 1:
             import subprocess
@@ -2619,13 +2726,10 @@ def main():
                     "--num-instances", str(args.num_instances),
                     "--ib", str(ib), "--dual-step", str(ds),
                     "--T", str(args.T), "--B", str(args.B), "--K", str(args.K),
-                    "--policy-iters", str(args.policy_iters),
                     "--label", f"{args.label}_ib{ib:g}_ds{ds:g}",
                     "--seed", str(args.seed),
                     "--eps-feas", str(args.eps_feas),
                 ]
-                if args.policy_ckpt is not None:
-                    cmd += ["--policy-ckpt", args.policy_ckpt]
                 if args.mc_only:
                     cmd.append("--mc-only")
                 if args.include_mc_variants:
@@ -2715,9 +2819,7 @@ def main():
                     seed=args.seed, device=device,
                     ced_ckpt=Path(args.ced_ckpt) if args.ced_ckpt else None,
                     hidden=args.hidden, num_layers=args.num_layers,
-                    policy_iters=args.policy_iters,
                     include_mc_variants=args.include_mc_variants,
-                    policy_net_pretrained=policy_net,
                 )
                 _save_cache(cache_path_cfg, data_list)
                 print(f"  saved cache {cache_path_cfg}")
@@ -2732,9 +2834,15 @@ def main():
                 "mc_o2_csat_mean": mc.get("opt2_csat", {}).get("mean"),
                 "mc_o2_mxrv_mean": mc.get("opt2_max_rel_vio", {}).get("mean"),
             })
-            print(f"  mc_teacher: Sharpe={sweep_summary[-1]['mc_sharpe_mean']:.3f}  "
-                  f"O2csat={sweep_summary[-1]['mc_o2_csat_mean']:.3f}  "
-                  f"O2mxrv={sweep_summary[-1]['mc_o2_mxrv_mean']:.3f}")
+            _ss = sweep_summary[-1]
+            _parts = []
+            if _ss['mc_sharpe_mean'] is not None:
+                _parts.append(f"Sharpe={_ss['mc_sharpe_mean']:.3f}")
+            if _ss['mc_o2_csat_mean'] is not None:
+                _parts.append(f"O2csat={_ss['mc_o2_csat_mean']:.3f}")
+            if _ss['mc_o2_mxrv_mean'] is not None:
+                _parts.append(f"O2mxrv={_ss['mc_o2_mxrv_mean']:.3f}")
+            print(f"  mc_teacher: {'  '.join(_parts) if _parts else 'no metrics'}")
 
         sweep_path = (Path(args.cache_dir) if args.cache_dir
                        else _project_root() / "outputs" / "portfolio" / "figures_cache"
@@ -2777,17 +2885,6 @@ def main():
 
     t0 = time.time()
     if data_list is None:
-        # Optional preloaded policy_net (used by sweep subprocesses)
-        policy_net_loaded = None
-        if args.policy_ckpt is not None and Path(args.policy_ckpt).exists():
-            N = PROBLEM_CONFIGS[args.size]["N"]
-            policy_net_loaded = bl.PortfolioPolicyNet(
-                N=N, hidden=args.hidden, num_layers=args.num_layers,
-            ).to(device)
-            state = torch.load(args.policy_ckpt, map_location=device, weights_only=False)
-            policy_net_loaded.load_state_dict(state)
-            policy_net_loaded.eval()
-            print(f"loaded policy_net from {args.policy_ckpt}")
         if args.num_instances <= 1:
             data = collect_all_weights(
                 size=args.size, ib=args.ib, dual_step=args.dual_step, T=args.T,
@@ -2795,7 +2892,6 @@ def main():
                 ced_ckpt=Path(args.ced_ckpt) if args.ced_ckpt else None,
                 hidden=args.hidden, num_layers=args.num_layers,
                 include_mc_variants=args.include_mc_variants,
-                policy_net_pretrained=policy_net_loaded,
                 mc_only=args.mc_only,
                 beta_schedule=args.beta_schedule,
                 pdl_primal_lr=args.pdl_primal_lr, pdl_dual_lr=args.pdl_dual_lr,
@@ -2805,6 +2901,7 @@ def main():
                 backbone=args.backbone, tagconv_K=args.tagconv_K,
                 mc_lambda_study=args.mc_lambda_study,
                 dps_scale=args.dps_scale, dps_sweep=args.dps_sweep,
+                pdm_proj_lr=args.pdm_proj_lr,
             )
             data_list = [data]
         else:
@@ -2814,9 +2911,7 @@ def main():
                 seed=args.seed, device=device,
                 ced_ckpt=Path(args.ced_ckpt) if args.ced_ckpt else None,
                 hidden=args.hidden, num_layers=args.num_layers,
-                policy_iters=args.policy_iters,
                 include_mc_variants=args.include_mc_variants,
-                policy_net_pretrained=policy_net_loaded,
                 mc_only=args.mc_only,
                 beta_schedule=args.beta_schedule,
                 pdl_primal_lr=args.pdl_primal_lr, pdl_dual_lr=args.pdl_dual_lr,
@@ -2826,6 +2921,7 @@ def main():
                 mc_lambda_study=args.mc_lambda_study,
                 dps_scale=args.dps_scale, dps_sweep=args.dps_sweep,
                 backbone=args.backbone, tagconv_K=args.tagconv_K,
+                pdm_proj_lr=args.pdm_proj_lr,
             )
         _save_cache(cache_path, data_list)
         print(f"Saved weights cache to {cache_path}")

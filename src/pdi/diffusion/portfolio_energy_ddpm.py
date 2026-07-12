@@ -29,6 +29,7 @@ from pdi.diffusion.energy_ddpm import EnergyDDPM
 
 __all__ = [
     "PortfolioEnergyDDPM", "PortfolioContext", "make_portfolio_problem",
+    "make_enriched_portfolio_problem",
     "shortfall_contributions_np", "shortfall_contributions_torch",
 ]
 
@@ -76,18 +77,68 @@ def variance_contributions_torch(w, Sigma):
 class PortfolioContext:
     """Per-batch tensors for portfolio expectation-constraint energy.
 
-    Expected-shortfall constraint:
-        E_xi[x_j * (alpha - r(xi)^T x)_+] <= b_j,  j = 1..N.
-
-    The expectation is evaluated by averaging across the stored ``scenarios``.
+    The full constraint vector concatenates:
+        [N variance budgets, 2S sector budgets, M stress budgets]
+    giving n_constraints = N + 2S + M total dual variables.
     """
 
     mu: torch.Tensor           # [N]
-    Sigma: torch.Tensor        # [N, N]  (kept for baselines/metrics; not used in E)
+    Sigma: torch.Tensor        # [N, N]
     scenarios: torch.Tensor    # [R, N]
-    risk_budgets: torch.Tensor # [N]
+    risk_budgets: torch.Tensor # [n_constraints]
     alpha: torch.Tensor        # scalar: shortfall threshold
-    r_min: torch.Tensor        # [B, N] (negated budgets for sign trick)
+    r_min: torch.Tensor        # [B, n_constraints] (negated budgets for sign trick)
+    sector_ids: Optional[torch.Tensor] = None     # [N] int: sector assignment per asset
+    num_sectors: int = 0
+    sector_upper: Optional[torch.Tensor] = None   # [S]
+    sector_lower: Optional[torch.Tensor] = None   # [S]
+    stress_returns: Optional[torch.Tensor] = None  # [M, N]
+    stress_limits: Optional[torch.Tensor] = None   # [M]
+    stress_eps: Optional[torch.Tensor] = None      # [M]
+    n_var_constraints: int = 0
+    n_sector_constraints: int = 0
+    n_stress_constraints: int = 0
+    neff_target: float = 500.0
+    constraint_scales: Optional[torch.Tensor] = None  # [n_constraints] per-constraint normalization
+
+
+# ---------------------------------------------------------------
+# Stress scenario generator
+# ---------------------------------------------------------------
+
+def _generate_stress_scenarios(
+    N: int,
+    sector_ids: np.ndarray,
+    num_sectors: int,
+    high_risk_sectors: set,
+    Sigma: np.ndarray,
+    rng: np.random.RandomState,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generate M = num_sectors + 2 synthetic stress scenarios.
+
+    Returns (stress_returns [M, N], loss_limits [M], stress_eps [M]).
+    """
+    M = num_sectors + 2
+    stress_returns = np.zeros((M, N))
+
+    # Scenario 0: broad market crash — all assets lose ~20%
+    stress_returns[0] = -0.20 + rng.uniform(-0.05, 0.05, N)
+
+    # Scenarios 1..S: sector crash — target sector loses ~35%, rest ~5%
+    for s in range(num_sectors):
+        mask = sector_ids == s
+        stress_returns[1 + s, mask] = -0.35 + rng.uniform(-0.05, 0.05, mask.sum())
+        stress_returns[1 + s, ~mask] = -0.05 + rng.uniform(-0.02, 0.02, (~mask).sum())
+
+    # Scenario S+1: high-volatility crash — high-var assets lose more
+    asset_vol = np.sqrt(np.diag(Sigma))
+    vol_rank = asset_vol / (asset_vol.max() + 1e-12)
+    stress_returns[-1] = -0.10 - 0.20 * vol_rank + rng.uniform(-0.03, 0.03, N)
+
+    loss_limits = np.full(M, 0.10)
+    stress_eps = np.full(M, 0.05)
+
+    return stress_returns, loss_limits, stress_eps
 
 
 # ---------------------------------------------------------------
@@ -266,7 +317,9 @@ def make_portfolio_problem(
     if budget_type == "uniform":
         budgets = gamma * np.full(N, c_eq.mean())
     else:
-        budgets = gamma * c_eq
+        budget_floor = kwargs.get("budget_floor", 0.1)
+        floor_val = budget_floor * c_eq.mean()
+        budgets = gamma * np.maximum(c_eq, floor_val)
 
     hr_scale = kwargs.get("high_risk_budget_scale", None)
     if hr_scale is not None and structure in ("sectors", "sectors_fat"):
@@ -280,6 +333,80 @@ def make_portfolio_problem(
                 budgets[j] *= hr_scale
 
     return mu, Sigma, scenarios, budgets, alpha
+
+
+def make_enriched_portfolio_problem(
+    N: int = 500,
+    K_factors: int = 50,
+    R_scenarios: int = 1000,
+    gamma: float = 3.0,
+    sector_gamma: float = 1.5,
+    seed: int = 0,
+    structure: str = "sectors",
+    num_sectors: int = 10,
+    budget_type: str = "uniform",
+    **kwargs,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, dict]:
+    """Generate portfolio problem with variance + sector + stress constraints.
+
+    The budget vector concatenates [N variance, 2*S sector, M stress] residual
+    thresholds.  Sector and stress residuals are already in f(x) <= 0 form,
+    so their budget entries are zero.
+
+    Returns (mu, Sigma, scenarios, budgets, alpha, extra) where extra contains
+    the sector/stress metadata needed by PortfolioEnergyDDPM.
+    """
+    mu, Sigma, scenarios, var_budgets, alpha = make_portfolio_problem(
+        N=N, K_factors=K_factors, R_scenarios=R_scenarios, gamma=gamma,
+        seed=seed, structure=structure, num_sectors=num_sectors,
+        constraint_type="variance", budget_type=budget_type, **kwargs,
+    )
+
+    S = num_sectors
+    sector_ids = np.arange(N) % S
+    x_eq = np.ones(N) / N
+
+    # --- Sector exposure constraints ---
+    x_eq_sector = np.bincount(sector_ids, weights=x_eq, minlength=S)
+    sector_upper = sector_gamma * x_eq_sector
+    sector_lower = x_eq_sector / sector_gamma
+    sector_budgets = np.zeros(2 * S)
+
+    # --- Stress-loss constraints ---
+    n_high_risk = kwargs.get("n_high_risk_sectors", 2)
+    rng_stress = np.random.RandomState(seed)
+    high_risk_sectors = set(rng_stress.choice(S, size=n_high_risk, replace=False))
+    stress_returns, loss_limits, stress_eps = _generate_stress_scenarios(
+        N, sector_ids, S, high_risk_sectors, Sigma,
+        np.random.RandomState(seed + 1000),
+    )
+    stress_budgets = np.zeros(len(loss_limits))
+
+    # Neff (cardinality) constraint: Neff(x) <= neff_target
+    neff_target = kwargs.get("neff_target", 60.0)
+    neff_budget = np.zeros(1)  # residual is Neff(x) - target <= 0
+
+    budgets = np.concatenate([var_budgets, sector_budgets, stress_budgets, neff_budget])
+
+    # Per-constraint normalization scales so all violations are O(1).
+    c_eq_var = (x_eq * (Sigma @ x_eq))  # [N] variance contributions at equal weight
+    var_scale = np.full(N, 1.0 / max(c_eq_var.mean(), 1e-12))
+    sector_scale = np.full(2 * S, 1.0 / max(x_eq_sector.mean(), 1e-12))
+    stress_scale = np.full(len(loss_limits), 1.0 / max(stress_eps.mean(), 1e-12))
+    neff_scale = np.full(1, 1.0 / N)
+    constraint_scales = np.concatenate([var_scale, sector_scale, stress_scale, neff_scale])
+
+    extra = dict(
+        sector_ids=sector_ids,
+        sector_upper=sector_upper,
+        sector_lower=sector_lower,
+        stress_returns=stress_returns,
+        stress_limits=loss_limits,
+        stress_eps=stress_eps,
+        neff_target=neff_target,
+        constraint_scales=constraint_scales,
+    )
+    return mu, Sigma, scenarios, budgets, alpha, extra
 
 
 # ---------------------------------------------------------------
@@ -387,6 +514,8 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             **kwargs,
         )
 
+        extra_constraints = kwargs.pop("extra_constraints", {})
+
         # Store problem data as buffers (moved with .to(device))
         if portfolio_mu is not None:
             self.register_buffer("_port_mu", torch.as_tensor(portfolio_mu, dtype=torch.float32))
@@ -400,6 +529,36 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             self.register_buffer("_port_scenarios", torch.empty(0))
             self.register_buffer("_port_risk_budgets", torch.empty(0))
             self.register_buffer("_port_alpha", torch.tensor(0.0))
+
+        # Extra constraint buffers (sector + stress)
+        if "sector_ids" in extra_constraints:
+            self.register_buffer("_sector_ids", torch.as_tensor(extra_constraints["sector_ids"], dtype=torch.long))
+            self.register_buffer("_sector_upper", torch.as_tensor(extra_constraints["sector_upper"], dtype=torch.float32))
+            self.register_buffer("_sector_lower", torch.as_tensor(extra_constraints["sector_lower"], dtype=torch.float32))
+            self._n_sector_constraints = 2 * len(extra_constraints["sector_upper"])
+        else:
+            self.register_buffer("_sector_ids", torch.empty(0, dtype=torch.long))
+            self.register_buffer("_sector_upper", torch.empty(0))
+            self.register_buffer("_sector_lower", torch.empty(0))
+            self._n_sector_constraints = 0
+
+        if "stress_returns" in extra_constraints:
+            self.register_buffer("_stress_returns", torch.as_tensor(extra_constraints["stress_returns"], dtype=torch.float32))
+            self.register_buffer("_stress_limits", torch.as_tensor(extra_constraints["stress_limits"], dtype=torch.float32))
+            self.register_buffer("_stress_eps", torch.as_tensor(extra_constraints["stress_eps"], dtype=torch.float32))
+            self._n_stress_constraints = len(extra_constraints["stress_limits"])
+        else:
+            self.register_buffer("_stress_returns", torch.empty(0))
+            self.register_buffer("_stress_limits", torch.empty(0))
+            self.register_buffer("_stress_eps", torch.empty(0))
+            self._n_stress_constraints = 0
+
+        self._neff_target = float(extra_constraints.get("neff_target", 500.0))
+
+        if "constraint_scales" in extra_constraints:
+            self.register_buffer("_constraint_scales", torch.as_tensor(extra_constraints["constraint_scales"], dtype=torch.float32))
+        else:
+            self.register_buffer("_constraint_scales", torch.empty(0))
 
     # ------------------------------------------------------------------
     # Context builder (overrides WRA channel-based context)
@@ -419,13 +578,39 @@ class PortfolioEnergyDDPM(EnergyDDPM):
         risk_budgets = self._port_risk_budgets.to(device=device, dtype=dtype)
         alpha = self._port_alpha.to(device=device, dtype=dtype)
 
-        # Sign trick: r_min = -budget so inherited dual ascent computes
-        # violation = r_min - (-c_j) = c_j - b_j (correct sign).
-        r_min = (-risk_budgets).unsqueeze(0).expand(batch_size, -1)  # [B, N]
+        if self._constraint_scales.numel() > 0:
+            scales = self._constraint_scales.to(device=device, dtype=dtype)
+            risk_budgets = risk_budgets * scales
+        r_min = (-risk_budgets).unsqueeze(0).expand(batch_size, -1)
+
+        ctx_kwargs = {}
+        N = mu.shape[0]
+        n_var = N  # default: one variance constraint per asset
+        if self.constraint_type in ("variance_band", "dual"):
+            n_var = 2 * N
+
+        if self._n_sector_constraints > 0:
+            ctx_kwargs["sector_ids"] = self._sector_ids.to(device=device)
+            ctx_kwargs["sector_upper"] = self._sector_upper.to(device=device, dtype=dtype)
+            ctx_kwargs["sector_lower"] = self._sector_lower.to(device=device, dtype=dtype)
+            ctx_kwargs["num_sectors"] = len(self._sector_upper)
+
+        if self._n_stress_constraints > 0:
+            ctx_kwargs["stress_returns"] = self._stress_returns.to(device=device, dtype=dtype)
+            ctx_kwargs["stress_limits"] = self._stress_limits.to(device=device, dtype=dtype)
+            ctx_kwargs["stress_eps"] = self._stress_eps.to(device=device, dtype=dtype)
+
+        if self._constraint_scales.numel() > 0:
+            ctx_kwargs["constraint_scales"] = self._constraint_scales.to(device=device, dtype=dtype)
 
         return PortfolioContext(
             mu=mu, Sigma=Sigma, scenarios=scenarios,
             risk_budgets=risk_budgets, alpha=alpha, r_min=r_min,
+            n_var_constraints=n_var,
+            n_sector_constraints=self._n_sector_constraints,
+            n_stress_constraints=self._n_stress_constraints,
+            neff_target=self._neff_target,
+            **ctx_kwargs,
         )
 
     def _init_dual_lambda(self, batch_size, num_nodes, *, device, dtype, init_value):
@@ -537,10 +722,31 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             c_var = self._variance_contributions(weights, context.Sigma)
             c_short = self._shortfall_contributions(weights, context.scenarios, context.alpha)
             c = torch.cat([c_var, c_short], dim=1)  # [B, 2N]
+        elif self.constraint_type == "enriched":
+            c_var = self._variance_contributions(weights, context.Sigma)
+            B_sz = weights.shape[0]
+            S = context.num_sectors
+            sid = context.sector_ids
+            exposure = torch.zeros(B_sz, S, device=weights.device, dtype=weights.dtype)
+            exposure.scatter_add_(1, sid.unsqueeze(0).expand(B_sz, -1), weights)
+            upper_res = exposure - context.sector_upper.unsqueeze(0)
+            lower_res = context.sector_lower.unsqueeze(0) - exposure
+            stress_port_ret = torch.matmul(weights, context.stress_returns.t())
+            excess_loss = torch.clamp(
+                -stress_port_ret - context.stress_limits.unsqueeze(0), min=0.0,
+            )
+            stress_res = excess_loss - context.stress_eps.unsqueeze(0)
+            # Neff constraint: Neff(x) - target <= 0
+            ent = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=1, keepdim=True)
+            neff_val = torch.exp(ent)  # [B, 1]
+            neff_res = neff_val - context.neff_target  # [B, 1]
+            c = torch.cat([c_var, upper_res, lower_res, stress_res, neff_res], dim=1)
+            if context.constraint_scales is not None:
+                c = c * context.constraint_scales.unsqueeze(0)
         else:
             raise ValueError(f"Unknown constraint_type: {self.constraint_type!r}")
 
-        negated_c = -c  # [B, N] or [B, 2N]
+        negated_c = -c
         ret_per_scenario = torch.matmul(context.scenarios, weights.t())  # [R, B]
         expected_return = ret_per_scenario.mean(dim=0)  # [B]
 
