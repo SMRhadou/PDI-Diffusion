@@ -159,17 +159,21 @@ def _compute_constraints(x, Sigma, scenarios, alpha, constraint_type, num_sector
         sector_lower = torch.as_tensor(extra["sector_lower"], device=x.device, dtype=x.dtype)
         upper_res = exposure - sector_upper.unsqueeze(0)
         lower_res = sector_lower.unsqueeze(0) - exposure
-        stress_ret_t = torch.as_tensor(extra["stress_returns"], device=x.device, dtype=x.dtype)
-        stress_lim_t = torch.as_tensor(extra["stress_limits"], device=x.device, dtype=x.dtype)
-        stress_eps_t = torch.as_tensor(extra["stress_eps"], device=x.device, dtype=x.dtype)
-        stress_port = torch.matmul(x, stress_ret_t.t())
-        excess_loss = torch.clamp(-stress_port - stress_lim_t.unsqueeze(0), min=0.0)
-        stress_res = excess_loss - stress_eps_t.unsqueeze(0)
+        parts = [c_var, upper_res, lower_res]
+        if "stress_returns" in extra:
+            stress_ret_t = torch.as_tensor(extra["stress_returns"], device=x.device, dtype=x.dtype)
+            stress_lim_t = torch.as_tensor(extra["stress_limits"], device=x.device, dtype=x.dtype)
+            stress_eps_t = torch.as_tensor(extra["stress_eps"], device=x.device, dtype=x.dtype)
+            stress_port = torch.matmul(x, stress_ret_t.t())
+            excess_loss = torch.clamp(-stress_port - stress_lim_t.unsqueeze(0), min=0.0)
+            stress_res = excess_loss - stress_eps_t.unsqueeze(0)
+            parts.append(stress_res)
         ent = -(x * torch.log(x.clamp_min(1e-12))).sum(dim=1, keepdim=True)
         neff_val = torch.exp(ent)
         neff_target = extra.get("neff_target", 500.0)
         neff_res = neff_val - neff_target
-        return torch.cat([c_var, upper_res, lower_res, stress_res, neff_res], dim=1)
+        parts.append(neff_res)
+        return torch.cat(parts, dim=1)
     else:
         port_ret = torch.matmul(scenarios, x.t())  # [R, B]
         S = torch.clamp_min(alpha - port_ret, 0.0).mean(dim=0)  # [B]
@@ -289,7 +293,7 @@ def project_to_feasible(x: torch.Tensor, Sigma: torch.Tensor,
             grad = torch.autograd.grad(loss, z_req)[0]
             z = (z_req - lr * grad).detach()
         w_out = torch.softmax(z, dim=-1).detach()
-        raw_viol = (c - bud_t).clamp_min(0.0)
+        raw_viol = (c - bud_t).clamp_min(0.0).detach()
         w_out._proj_max_raw_vio = float(raw_viol.max())
         w_out._proj_mean_raw_vio = float(raw_viol.mean())
         w_out._proj_frac_satisfied = float((raw_viol.max(dim=1).values < 1e-8).float().mean())

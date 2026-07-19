@@ -66,10 +66,32 @@ PROBLEM_CONFIGS = {
     "crypto_band": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
                         structure="sectors", num_sectors=10,
                         constraint_type="variance_band"),
-    "crypto_enriched": dict(N=500, K_factors=50, R_scenarios=1000, gamma=3.0, seed=0,
-                            structure="sectors", num_sectors=10,
-                            budget_type="uniform", constraint_type="enriched"),
 }
+
+
+def expand_enriched_lambda(dual_lambda, num_nodes, num_sectors=10, log1p=True):
+    """Map [B, n_constraints] → [B, N, C] for enriched portfolio constraints.
+
+    Sector upper/lower duals are separate channels (they demand opposite
+    responses; summing them made the direction unidentifiable).
+    C=5 with stress (var, sec_upper, sec_lower, stress, Neff),
+    C=4 without (var, sec_upper, sec_lower, Neff).
+    """
+    B, C_total = dual_lambda.shape
+    N = num_nodes
+    S = num_sectors
+    dl = torch.log1p(dual_lambda) if log1p else dual_lambda
+    var_lam = dl[:, :N]
+    sector_ids = torch.arange(N, device=dl.device) % S
+    sec_up_node = dl[:, N:N + S][:, sector_ids]
+    sec_lo_node = dl[:, N + S:N + 2 * S][:, sector_ids]
+    M = C_total - N - 2 * S - 1
+    neff_per_node = dl[:, -1:].expand(B, N)
+    if M > 0:
+        stress_mean = dl[:, N + 2 * S:N + 2 * S + M].mean(dim=1, keepdim=True).expand(B, N)
+        return torch.stack([var_lam, sec_up_node, sec_lo_node, stress_mean,
+                            neff_per_node], dim=-1)
+    return torch.stack([var_lam, sec_up_node, sec_lo_node, neff_per_node], dim=-1)
 
 
 class _NoOpModel(nn.Module):
@@ -201,12 +223,19 @@ def main():
     p.add_argument("--buffer-cap", type=int, default=8192)
     p.add_argument("--eval-every", type=int, default=20,
                    help="Evaluate every N outer iterations")
+    p.add_argument("--eval-start", type=int, default=0,
+                   help="Skip eval until this outer iteration")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--label", type=str, required=True)
     p.add_argument("--target-clip-norm", type=float, default=20.0)
     p.add_argument("--perturb-fraction", type=float, default=0.5)
     p.add_argument("--perturb-x-std", type=float, default=0.5)
     p.add_argument("--perturb-lambda-std", type=float, default=0.5)
+    p.add_argument("--perturb-lambda-add", type=float, default=0.0,
+                   help="Additive lambda perturbation scale (x prior mean mu(t)); "
+                        "resurrects zeroed lambdas. 0=off (portfolio only)")
+    p.add_argument("--perturb-lambda-add-frac", type=float, default=0.25,
+                   help="Fraction of lambda entries receiving the additive kick")
     p.add_argument("--num-rollouts-per-outer", type=int, default=4)
     p.add_argument("--dual-lambda-max", type=float, default=50.0)
     p.add_argument("--lam0", type=float, default=0.1)
@@ -216,6 +245,12 @@ def main():
     p.add_argument("--constraint-type", type=str, default=None,
                    help="Override constraint type from problem config")
     p.add_argument("--sector-gamma", type=float, default=1.5)
+    p.add_argument("--skip-stress", action="store_true", default=False,
+                   help="Enriched without stress constraints")
+    p.add_argument("--no-log1p-lambda", action="store_true", default=False,
+                   help="Disable log1p normalization of lambda conditioning")
+    p.add_argument("--lambda-dropout", type=float, default=0.0,
+                   help="Fraction of minibatch samples with lambda zeroed out (CFG-style)")
     p.add_argument("--problem-seed", type=int, default=None,
                    help="Override problem seed (for multi-instance training)")
     p.add_argument("--rotate-every", type=int, default=0,
@@ -224,6 +259,12 @@ def main():
                    help="Number of problem instances to rotate through")
     p.add_argument("--num-val-instances", type=int, default=10,
                    help="Number of held-out val instances (seeds start at 1000)")
+    p.add_argument("--best-min-csat", type=float, default=0.8,
+                   help="best_* checkpoints require val csat >= this floor")
+    p.add_argument("--best-min-neff", type=float, default=5.0,
+                   help="best_* checkpoints require val Neff >= this floor")
+    p.add_argument("--best-gate-csat", type=float, default=0.9,
+                   help="csat gate for best_return / best_neff checkpoints")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -243,7 +284,7 @@ def main():
         constraint_type = args.constraint_type
     if constraint_type == "enriched":
         mu_np, Sigma_np, scen_np, bud_np, alpha, _extra_constraints = \
-            make_enriched_portfolio_problem(sector_gamma=args.sector_gamma, **pcfg)
+            make_enriched_portfolio_problem(sector_gamma=args.sector_gamma, skip_stress=args.skip_stress, **pcfg)
         ret_mean = abs(scen_np.mean(axis=0)).mean()
         obj_scale = 1.0 / max(ret_mean, 1e-12)
         constraint_scale = 1.0
@@ -291,7 +332,10 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Score net
-    _lambda_channels = 4 if constraint_type == "enriched" else 1
+    if constraint_type == "enriched":
+        _lambda_channels = 4 if args.skip_stress else 5
+    else:
+        _lambda_channels = 1
     _cond_ch = _lambda_channels  # no dataset cond, so total cond = lambda channels
     if args.backbone == "gnn":
         backbone = PortfolioGNNBackbone(
@@ -304,8 +348,7 @@ def main():
             num_timesteps=args.T, cond_channels=_cond_ch,
         )
     score_net = ScoreNetWithLambda(backbone=backbone, expected_cond_feats=0,
-                                   lambda_channels=_lambda_channels,
-                                   num_sectors=pcfg.get("num_sectors", 10))
+                                   lambda_channels=_lambda_channels)
     log.info("score_net params: %.2fM", sum(p.numel() for p in score_net.parameters()) / 1e6)
 
     # MC sampler for training
@@ -357,6 +400,35 @@ def main():
         config=cfg, device=device, rng_seed=args.seed,
     )
 
+    # Override buffer push: count T per record (not T×B) so capacity
+    # limits the number of (instance, timestep) pairs, not samples.
+    from pdi.trainers.energy_score.trajectory_buffer import _RolloutRecord
+    def _portfolio_push(data, x_by_t, lambda_by_t, t_values,
+                        sample_weights=None, persistent=False):
+        buf = trainer.buffer
+        T = x_by_t.shape[0]
+        sw = None
+        if sample_weights is not None:
+            sw = sample_weights.detach().to("cpu", torch.float32).contiguous()
+        record = _RolloutRecord(
+            data=data.detach().cpu() if hasattr(data, "detach") else data.cpu(),
+            x_by_t=x_by_t.detach().to("cpu", torch.float32).contiguous(),
+            lambda_by_t=lambda_by_t.detach().to("cpu", torch.float32).contiguous(),
+            t_values=t_values.detach().to("cpu", torch.long).contiguous(),
+            sample_weights=sw,
+            persistent=bool(persistent),
+        )
+        buf._records.append(record)
+        buf._entry_count += T
+        while buf._entry_count > buf.capacity:
+            evict_idx = next(
+                (i for i, r in enumerate(buf._records) if not r.persistent), None)
+            if evict_idx is None or len(buf._records) <= 1:
+                break
+            oldest = buf._records.pop(evict_idx)
+            buf._entry_count -= oldest.t_values.shape[0]
+    trainer.buffer.push_trajectory = _portfolio_push
+
     # Monkey-patch _build_micro_context to read instance data from PyG batch
     _orig_build_ctx = trainer._build_micro_context
     def _patched_build_ctx(data):
@@ -368,15 +440,34 @@ def main():
             scenarios = data._port_scenarios.to(dev)
             risk_budgets = data._port_risk_budgets.to(dev)
             alpha_val = data._port_alpha.to(dev)
-            mu = mc_sampler._port_mu.to(dev)  # mu not needed for constraints but context requires it
+            mu = mc_sampler._port_mu.to(dev)
             r_min = (-risk_budgets).unsqueeze(0).expand(batch_size, -1)
-            ctx = PortfolioContext(
+            ctx_kwargs = {}
+            if hasattr(data, "_port_extra") and data._port_extra:
+                ex = data._port_extra
+                if "sector_ids" in ex:
+                    ctx_kwargs["sector_ids"] = torch.as_tensor(ex["sector_ids"], dtype=torch.long, device=dev)
+                    ctx_kwargs["sector_upper"] = torch.as_tensor(ex["sector_upper"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["sector_lower"] = torch.as_tensor(ex["sector_lower"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["num_sectors"] = len(ex["sector_upper"])
+                    ctx_kwargs["n_sector_constraints"] = 2 * len(ex["sector_upper"])
+                if "stress_returns" in ex:
+                    ctx_kwargs["stress_returns"] = torch.as_tensor(ex["stress_returns"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["stress_limits"] = torch.as_tensor(ex["stress_limits"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["stress_eps"] = torch.as_tensor(ex["stress_eps"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["n_stress_constraints"] = len(ex["stress_limits"])
+                if "neff_target" in ex:
+                    ctx_kwargs["neff_target"] = float(ex["neff_target"])
+                if "constraint_scales" in ex:
+                    cs = torch.as_tensor(ex["constraint_scales"], dtype=torch.float32, device=dev)
+                    ctx_kwargs["constraint_scales"] = cs
+                    risk_budgets = risk_budgets * cs
+                    r_min = (-risk_budgets).unsqueeze(0).expand(batch_size, -1)
+            return PortfolioContext(
                 mu=mu, Sigma=Sigma, scenarios=scenarios,
                 risk_budgets=risk_budgets, alpha=alpha_val, r_min=r_min,
+                **ctx_kwargs,
             )
-            if hasattr(data, "_port_extra") and data._port_extra:
-                ctx.extra = data._port_extra
-            return ctx
         return _orig_build_ctx(data)
     trainer._build_micro_context = _patched_build_ctx
 
@@ -425,7 +516,7 @@ def main():
                 "cond_full": None,
                 "edge_index": A_batch,
                 "edge_weight": None,
-                "num_nodes": num_nodes,
+                "num_nodes": lam_mb.shape[1],
                 "batch_size": n,
             })
         return {"micro_batches": micro_batches}
@@ -463,6 +554,17 @@ def main():
                     idx = mask.nonzero(as_tuple=True)[0]
                     ub["x_t"][idx] += trainer.cfg.perturb_x_std * torch.randn_like(ub["x_t"][idx])
                     lam[idx] = (lam[idx] * (1.0 + trainer.cfg.perturb_lambda_std * torch.randn_like(lam[idx]))).clamp_min(0.0)
+                    if args.perturb_lambda_add > 0:
+                        # Additive kick on a sparse mask: reaches lambda patterns
+                        # multiplicative jitter cannot (zeros stay zero under x).
+                        mu_t = trainer.lambda_prior.mean_at_t(ub["t"][idx]).to(lam.dtype).view(-1, 1)
+                        add_mask = (torch.rand_like(lam[idx]) < args.perturb_lambda_add_frac).float()
+                        lam[idx] = lam[idx] + add_mask * args.perturb_lambda_add * mu_t * torch.randn_like(lam[idx]).abs()
+
+            if args.lambda_dropout > 0:
+                drop_mask = torch.rand(M, device=trainer.device) < args.lambda_dropout
+                if drop_mask.any():
+                    lam[drop_mask] = 0.0
 
             with torch.no_grad():
                 context = trainer._build_micro_context(ub["data"])
@@ -470,10 +572,13 @@ def main():
                 eps_parts = []
                 from dataclasses import fields as _dc_fields, replace as _dc_replace
                 ctx_fields = _dc_fields(context)
+                _batch_ctx_fields = {"r_min", "risk_budgets"}
                 for c0 in range(0, M, mc_chunk):
                     c1 = min(c0 + mc_chunk, M)
                     ctx_updates = {}
                     for f in ctx_fields:
+                        if f.name not in _batch_ctx_fields:
+                            continue
                         v = getattr(context, f.name)
                         if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == M:
                             ctx_updates[f.name] = v[c0:c1]
@@ -493,8 +598,9 @@ def main():
                     eps_parts.append(eps_c)
                 eps_target = torch.cat(eps_parts, dim=0)
 
+            lam_net = expand_enriched_lambda(lam, N, pcfg.get("num_sectors", 10), log1p=not args.no_log1p_lambda) if constraint_type == "enriched" else lam
             eps_pred = trainer.score_net(
-                x=ub["x_t"], timesteps=ub["t"], dual_lambda=lam,
+                x=ub["x_t"], timesteps=ub["t"], dual_lambda=lam_net,
                 edge_index=ub["edge_index"], edge_weight=ub["edge_weight"],
                 cond=ub["cond_full"], return_intermediates=False,
             )
@@ -569,7 +675,7 @@ def main():
         if constraint_type == "enriched":
             v_mu, v_Sig, v_scen, v_bud, v_alpha, v_extra = \
                 make_enriched_portfolio_problem(
-                    sector_gamma=args.sector_gamma, **_vpcfg)
+                    sector_gamma=args.sector_gamma, skip_stress=args.skip_stress, **_vpcfg)
         else:
             v_mu, v_Sig, v_scen, v_bud, v_alpha = make_portfolio_problem(
                 constraint_type=_vct, **_vpcfg)
@@ -590,6 +696,21 @@ def main():
         if constraint_type == "enriched" and "constraint_scales" in v_extra:
             inst_dict["constraint_scales"] = torch.tensor(
                 v_extra["constraint_scales"], dtype=torch.float32, device=device)
+            S = pcfg.get("num_sectors", 10)
+            sid = torch.as_tensor(v_extra["sector_ids"], dtype=torch.long, device=device)
+            _egpu = {
+                "S": S,
+                "sector_ids_exp": sid.unsqueeze(0).expand(args.eval_B, -1),
+                "sector_upper": torch.as_tensor(v_extra["sector_upper"], dtype=torch.float32, device=device).unsqueeze(0),
+                "sector_lower": torch.as_tensor(v_extra["sector_lower"], dtype=torch.float32, device=device).unsqueeze(0),
+                "neff_target": float(v_extra["neff_target"]),
+                "constraint_scales": inst_dict["constraint_scales"].unsqueeze(0),
+            }
+            if "stress_returns" in v_extra:
+                _egpu["stress_returns_t"] = torch.as_tensor(v_extra["stress_returns"], dtype=torch.float32, device=device).t()
+                _egpu["stress_limits"] = torch.as_tensor(v_extra["stress_limits"], dtype=torch.float32, device=device).unsqueeze(0)
+                _egpu["stress_eps"] = torch.as_tensor(v_extra["stress_eps"], dtype=torch.float32, device=device).unsqueeze(0)
+            inst_dict["_enriched_gpu"] = _egpu
         val_instances.append(inst_dict)
     log.info("val dataset: %d instances (seeds 1000-%d)", len(val_instances), 1000 + len(val_instances) - 1)
 
@@ -649,8 +770,9 @@ def main():
             dl_full = dual_lambda.unsqueeze(1).expand(n_inst, B, _n_constraints).reshape(B_total, _n_constraints)
 
             with torch.no_grad():
+                dl_net = expand_enriched_lambda(dl_full, N, pcfg.get("num_sectors", 10), log1p=not args.no_log1p_lambda) if constraint_type == "enriched" else dl_full
                 eps_pred = score_net_to_eval(
-                    x=x_t, timesteps=t, dual_lambda=dl_full,
+                    x=x_t, timesteps=t, dual_lambda=dl_net,
                     edge_index=_val_A_batched, edge_weight=None,
                     cond=None, return_intermediates=False,
                 )
@@ -671,14 +793,26 @@ def main():
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
                 if constraint_type == "enriched":
-                    w_i_detached = w_i.detach()
-                    c_i = _compute_constraints(w_i_detached, val_instances[i]["Sigma"],
-                                               val_instances[i]["scenarios"], val_instances[i]["alpha"],
-                                               "enriched", extra=val_instances[i]["extra"])
-                    if val_instances[i].get("constraint_scales") is not None:
-                        cs = val_instances[i]["constraint_scales"].unsqueeze(0)
-                        c_i = c_i * cs
-                    violation_i = c_i - val_instances[i]["budgets"].unsqueeze(0)
+                    c_var = (w_i * torch.matmul(w_i, val_instances[i]["Sigma"]))
+                    ex = val_instances[i]["_enriched_gpu"]
+                    B_val = w_i.shape[0]
+                    exposure = torch.zeros(B_val, ex["S"], device=device, dtype=w_i.dtype)
+                    exposure.scatter_add_(1, ex["sector_ids_exp"][:B_val], w_i)
+                    upper_res = exposure - ex["sector_upper"]
+                    lower_res = ex["sector_lower"] - exposure
+                    _parts = [c_var, upper_res, lower_res]
+                    if "stress_returns_t" in ex:
+                        stress_port = torch.matmul(w_i, ex["stress_returns_t"])
+                        excess_loss = torch.clamp(-stress_port - ex["stress_limits"], min=0.0)
+                        _parts.append(excess_loss - ex["stress_eps"])
+                    ent = -(w_i * torch.log(w_i.clamp_min(1e-12))).sum(dim=1, keepdim=True)
+                    _parts.append(torch.exp(ent) - ex["neff_target"])
+                    c_i = torch.cat(_parts, dim=1)
+                    if ex.get("constraint_scales") is not None:
+                        c_i = c_i * ex["constraint_scales"]
+                        violation_i = c_i - (val_instances[i]["budgets"] * val_instances[i]["constraint_scales"]).unsqueeze(0)
+                    else:
+                        violation_i = c_i - val_instances[i]["budgets"].unsqueeze(0)
                 elif constraint_type == "variance_band":
                     c_var = variance_contributions_torch(w_i, val_instances[i]["Sigma"]) * constraint_scale
                     negated_c = torch.cat([-c_var, c_var], dim=1)
@@ -733,6 +867,8 @@ def main():
     best_feas = {"feas_relaxed": -1.0, "iter": -1, "state": None, "metrics": None}
     best_pareto = {"pareto": -float("inf"), "iter": -1, "state": None, "metrics": None}
     best_vio = {"vio": float("inf"), "iter": -1, "state": None, "metrics": None}
+    best_return = {"ret": -float("inf"), "iter": -1, "state": None, "metrics": None}
+    best_neff = {"neff": -float("inf"), "iter": -1, "state": None, "metrics": None}
 
     history = []
     eval_history = []
@@ -762,36 +898,59 @@ def main():
                  metrics["neff"], metrics["n_top1"])
 
         _sd = {k: v.detach().cpu().clone() for k, v in score_net.state_dict().items()}
-        if metrics["sharpe"] > best_sharpe["sharpe"]:
+        # Degenerate (collapsed) nets can win single metrics — e.g. a one-hot
+        # net minimizes batch-mean max-violation — so best_* checkpoints are
+        # only eligible above these floors.
+        eligible = (metrics["opt2_csat"] >= args.best_min_csat
+                    and metrics["neff"] >= args.best_min_neff)
+        if not eligible:
+            log.info("  [checkpoint] ineligible for best_* (csat=%.3f < %g or "
+                     "Neff=%.1f < %g)", metrics["opt2_csat"], args.best_min_csat,
+                     metrics["neff"], args.best_min_neff)
+        if eligible and metrics["sharpe"] > best_sharpe["sharpe"]:
             best_sharpe.update(sharpe=metrics["sharpe"], iter=sgd_count,
                                state=_sd, metrics=metrics.copy())
             torch.save(_sd, out_dir / "score_net_best_sharpe.pt")
-        if metrics["opt2_csat"] > best_feas["feas_relaxed"]:
+        if eligible and metrics["opt2_csat"] > best_feas["feas_relaxed"]:
             best_feas.update(feas_relaxed=metrics["opt2_csat"], iter=sgd_count,
                              state=_sd, metrics=metrics.copy())
             torch.save(_sd, out_dir / "score_net_best_feas.pt")
         pareto_score = metrics["opt2_csat"] + 0.1 * metrics["sharpe"]
-        if pareto_score > best_pareto["pareto"]:
+        if eligible and pareto_score > best_pareto["pareto"]:
             best_pareto.update(pareto=pareto_score, iter=sgd_count,
                                state=_sd, metrics=metrics.copy())
             torch.save(_sd, out_dir / "score_net_best_pareto.pt")
-        if metrics["opt2_max_vio"] < best_vio["vio"]:
-            best_vio.update(vio=metrics["opt2_max_vio"], iter=sgd_count,
+        if eligible and metrics["vio_mean"] < best_vio["vio"]:
+            best_vio.update(vio=metrics["vio_mean"], iter=sgd_count,
                             state=_sd, metrics=metrics.copy())
             torch.save(_sd, out_dir / "score_net_best_vio.pt")
+        # Constrained selections: best return / best Neff subject to csat gate.
+        gated = eligible and metrics["opt2_csat"] >= args.best_gate_csat
+        if gated and metrics["ret"] > best_return["ret"]:
+            best_return.update(ret=metrics["ret"], iter=sgd_count,
+                               state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_return.pt")
+        if gated and metrics["neff"] > best_neff["neff"]:
+            best_neff.update(neff=metrics["neff"], iter=sgd_count,
+                             state=_sd, metrics=metrics.copy())
+            torch.save(_sd, out_dir / "score_net_best_neff.pt")
         torch.save(_sd, out_dir / "score_net_last.pt")
         score_net.train()
 
     # Pre-generate all training instances
+    log.info("pre-generating %d training instances...", args.num_instances)
+    _t_gen = time.time()
     _all_train_instances = []
     for si in range(args.num_instances):
+        if (si + 1) % 50 == 0 or si == 0:
+            log.info("  generating instance %d/%d...", si + 1, args.num_instances)
         _tpcfg = dict(PROBLEM_CONFIGS[args.size])
         _tpcfg["seed"] = si
         _tct = _tpcfg.pop("constraint_type", "shortfall")
         if constraint_type == "enriched":
             t_mu, t_Sig, t_scen, t_bud, t_alpha, t_extra = \
                 make_enriched_portfolio_problem(
-                    sector_gamma=args.sector_gamma, **_tpcfg)
+                    sector_gamma=args.sector_gamma, skip_stress=args.skip_stress, **_tpcfg)
         else:
             t_mu, t_Sig, t_scen, t_bud, t_alpha = make_portfolio_problem(
                 constraint_type=_tct, **_tpcfg)
@@ -810,6 +969,21 @@ def main():
         if constraint_type == "enriched" and "constraint_scales" in t_extra:
             inst["constraint_scales"] = torch.tensor(
                 t_extra["constraint_scales"], dtype=torch.float32, device=device)
+            S = pcfg.get("num_sectors", 10)
+            sid = torch.as_tensor(t_extra["sector_ids"], dtype=torch.long, device=device)
+            _tegpu = {
+                "S": S,
+                "sector_ids_exp": sid.unsqueeze(0).expand(args.batch_size, -1),
+                "sector_upper": torch.as_tensor(t_extra["sector_upper"], dtype=torch.float32, device=device).unsqueeze(0),
+                "sector_lower": torch.as_tensor(t_extra["sector_lower"], dtype=torch.float32, device=device).unsqueeze(0),
+                "neff_target": float(t_extra["neff_target"]),
+                "constraint_scales": inst["constraint_scales"].unsqueeze(0),
+            }
+            if "stress_returns" in t_extra:
+                _tegpu["stress_returns_t"] = torch.as_tensor(t_extra["stress_returns"], dtype=torch.float32, device=device).t()
+                _tegpu["stress_limits"] = torch.as_tensor(t_extra["stress_limits"], dtype=torch.float32, device=device).unsqueeze(0)
+                _tegpu["stress_eps"] = torch.as_tensor(t_extra["stress_eps"], dtype=torch.float32, device=device).unsqueeze(0)
+            inst["_enriched_gpu"] = _tegpu
         _all_train_instances.append(inst)
     log.info("pre-generated %d training instances (with correlation graphs)", len(_all_train_instances))
 
@@ -846,8 +1020,9 @@ def main():
             t_values.append(t_int)
 
             with torch.no_grad():
+                dl_net = expand_enriched_lambda(dl_full, N, pcfg.get("num_sectors", 10), log1p=not args.no_log1p_lambda) if constraint_type == "enriched" else dl_full
                 eps_pred = score_net(
-                    x=x_t, timesteps=t, dual_lambda=dl_full,
+                    x=x_t, timesteps=t, dual_lambda=dl_net,
                     edge_index=rollout_A, edge_weight=None,
                     cond=None, return_intermediates=False,
                 )
@@ -868,14 +1043,25 @@ def main():
                 lo, hi = i * B, (i + 1) * B
                 w_i = torch.softmax(x0_pred[lo:hi, 0, :, 0], dim=-1)
                 if constraint_type == "enriched":
-                    w_i_detached = w_i.detach()
-                    c_i = _compute_constraints(w_i_detached, instances[i]["Sigma"],
-                                               instances[i]["scenarios"], instances[i]["alpha"],
-                                               "enriched", extra=instances[i]["extra"])
-                    if instances[i].get("constraint_scales") is not None:
-                        cs = instances[i]["constraint_scales"].unsqueeze(0)
-                        c_i = c_i * cs
-                    violation_i = c_i - instances[i]["budgets"].unsqueeze(0)
+                    c_var = (w_i * torch.matmul(w_i, instances[i]["Sigma"]))
+                    ex = instances[i]["_enriched_gpu"]
+                    exposure = torch.zeros(B, ex["S"], device=device, dtype=w_i.dtype)
+                    exposure.scatter_add_(1, ex["sector_ids_exp"][:B], w_i)
+                    upper_res = exposure - ex["sector_upper"]
+                    lower_res = ex["sector_lower"] - exposure
+                    _parts_r = [c_var, upper_res, lower_res]
+                    if "stress_returns_t" in ex:
+                        stress_port = torch.matmul(w_i, ex["stress_returns_t"])
+                        excess_loss = torch.clamp(-stress_port - ex["stress_limits"], min=0.0)
+                        _parts_r.append(excess_loss - ex["stress_eps"])
+                    ent = -(w_i * torch.log(w_i.clamp_min(1e-12))).sum(dim=1, keepdim=True)
+                    _parts_r.append(torch.exp(ent) - ex["neff_target"])
+                    c_i = torch.cat(_parts_r, dim=1)
+                    if ex.get("constraint_scales") is not None:
+                        c_i = c_i * ex["constraint_scales"]
+                        violation_i = c_i - (instances[i]["budgets"] * instances[i]["constraint_scales"]).unsqueeze(0)
+                    else:
+                        violation_i = c_i - instances[i]["budgets"].unsqueeze(0)
                 elif constraint_type == "variance_band":
                     c_var = variance_contributions_torch(w_i, instances[i]["Sigma"]) * constraint_scale
                     negated_c = torch.cat([-c_var, c_var], dim=1)
@@ -908,6 +1094,13 @@ def main():
         # Push per-instance trajectories to buffer (attach instance data to PyG batch)
         x_stack = torch.stack(x_by_t, dim=0)      # [T, B_total, 1, N, 1]
         l_stack = torch.stack(lambda_by_t, dim=0)  # [T, B_total, C]
+
+        _lflat = l_stack.reshape(-1)
+        _lidx = torch.randperm(len(_lflat))[:min(100000, len(_lflat))]
+        _lsample = _lflat[_lidx]
+        log.info("  lambda stats (all t): max=%.2f p96=%.2f mean=%.2f",
+                 float(_lflat.max()), float(_lsample.quantile(0.96)),
+                 float(_lflat.mean()))
         t_tensor = torch.tensor(t_values, dtype=torch.long)
         for i in range(n_inst):
             lo, hi = i * B, (i + 1) * B
@@ -944,8 +1137,13 @@ def main():
     t0 = time.time()
     score_net.train()
     _sgd_count = 0
+    log.info("starting training loop...")
     for outer in range(args.num_outer):
+        t_rollout = time.time()
         _batched_rollout(outer)
+        log.info("[outer %d/%d] rollout done (%.1fs), buffer=%d records",
+                 outer + 1, args.num_outer, time.time() - t_rollout,
+                 trainer.buffer.num_records)
         # Ramp inner steps: linear from inner_steps to inner_steps_max
         frac = min(_sgd_count / max(args.inner_steps_ramp_iter, 1), 1.0)
         n_inner = int(args.inner_steps + frac * (args.inner_steps_max - args.inner_steps))
@@ -955,7 +1153,7 @@ def main():
             if scheduler:
                 scheduler.step()
             _sgd_count += 1
-        if (outer + 1) % args.eval_every == 0:
+        if (outer + 1) % args.eval_every == 0 and (outer + 1) >= args.eval_start:
             _eval_and_checkpoint(outer, _sgd_count)
     train_wall = time.time() - t0
     log.info("training done in %.1f s (%.1f min)", train_wall, train_wall / 60)

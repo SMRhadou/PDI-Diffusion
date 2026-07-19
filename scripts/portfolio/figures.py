@@ -164,19 +164,56 @@ def _install_lambda_trace(sampler):
     return sampler
 
 
-def _make_trained_score_estimator(score_net, alphas_cumprod, dense_A=None):
+def _expand_enriched_lambda(dual_lambda, num_nodes, num_sectors=10, use_log1p=True,
+                            split_sector=False):
+    """Map [B, n_constraints] → [B, N, C] for enriched portfolio constraints.
+
+    split_sector=False (legacy 3/4-channel nets): sector upper+lower duals
+    are summed into one channel.
+    split_sector=True (4/5-channel nets): upper and lower are separate
+    channels, matching train_portfolio.expand_enriched_lambda.
+    """
+    B, C_total = dual_lambda.shape
+    N = num_nodes
+    S = num_sectors
+    dl = torch.log1p(dual_lambda) if use_log1p else dual_lambda
+    var_lam = dl[:, :N]
+    sector_ids = torch.arange(N, device=dl.device) % S
+    if split_sector:
+        sec_channels = [dl[:, N:N + S][:, sector_ids],
+                        dl[:, N + S:N + 2 * S][:, sector_ids]]
+    else:
+        sec_sum = dl[:, N:N + S] + dl[:, N + S:N + 2 * S]
+        sec_channels = [sec_sum[:, sector_ids]]
+    M = C_total - N - 2 * S - 1
+    neff_per_node = dl[:, -1:].expand(B, N)
+    parts = [var_lam] + sec_channels
+    if M > 0:
+        parts.append(dl[:, N + 2 * S:N + 2 * S + M].mean(dim=1, keepdim=True).expand(B, N))
+    parts.append(neff_per_node)
+    return torch.stack(parts, dim=-1)
+
+
+def _make_trained_score_estimator(score_net, alphas_cumprod, dense_A=None,
+                                   constraint_type="variance", num_sectors=10,
+                                   use_log1p=True, split_sector=False):
     _empty_ei = torch.zeros((2, 0), dtype=torch.long)
 
     def _fn(self, x_t, t, context, dual_lambda, inverse_beta_override=None):
         del context, inverse_beta_override
         B = x_t.shape[0]
+        N = x_t.shape[2]
         if dense_A is not None:
             ei = dense_A.to(x_t.device).unsqueeze(0).expand(B, -1, -1)
         else:
             ei = _empty_ei.to(x_t.device)
+        dl = dual_lambda
+        if constraint_type == "enriched" and dl.dim() == 2 and dl.shape[1] > N:
+            dl = _expand_enriched_lambda(dl, N, num_sectors, use_log1p=use_log1p,
+                                         split_sector=split_sector)
         with torch.no_grad():
             eps_pred = score_net(
-                x=x_t, timesteps=t, dual_lambda=dual_lambda,
+                x=x_t, timesteps=t, dual_lambda=dl,
                 edge_index=ei, edge_weight=None,
                 cond=None, return_intermediates=False,
             )
@@ -241,7 +278,8 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                          mc_lambda_study: bool = False,
                          dps_scale: float = 1.0,
                          dps_sweep: str = None,
-                         pdm_proj_lr: float = 0.1) -> dict:
+                         pdm_proj_lr: float = 0.1,
+                         use_log1p_lambda: bool = True) -> dict:
     """Run all methods and return a dict of {method_name: weights_tensor [B, N]}.
 
     Args:
@@ -263,6 +301,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                 seed=pcfg.get("seed", 0), structure=pcfg.get("structure", "sectors"),
                 num_sectors=pcfg.get("num_sectors", 10),
                 budget_type=pcfg.get("budget_type", "uniform"),
+                skip_stress=pcfg.get("skip_stress", False),
             )
         ret_mean = abs(scen_np.mean(axis=0)).mean()
         _obj_scale = 1.0 / max(ret_mean, 1e-12)
@@ -560,23 +599,42 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
         import types as _types_net
         _use_gnn = backbone == "gnn"
         _tagconv_K = tagconv_K
+        # Infer lambda channel count from the checkpoint itself (GNN input_proj
+        # is Linear(1 + C, hidden)): legacy nets sum sector upper+lower duals
+        # into one channel (C=3/4), split-sector nets keep them separate (C=4/5).
+        _lambda_ch = (3 if pcfg.get("skip_stress") else 4) if constraint_type == "enriched" else 1
+        _split_sector = False
+        if _use_gnn:
+            _state_probe = torch.load(ced_ckpt, map_location="cpu", weights_only=False)
+            _ipw = _state_probe.get("backbone.input_proj.weight")
+            if _ipw is not None:
+                _lambda_ch = int(_ipw.shape[1]) - 1
+                _legacy_ch = 3 if pcfg.get("skip_stress") else 4
+                _split_sector = (constraint_type == "enriched"
+                                 and _lambda_ch == _legacy_ch + 1)
+            del _state_probe
+        _cond_ch = _lambda_ch
         if _use_gnn:
             backbone = PortfolioGNNBackbone(d=N, hidden=hidden,
                                             num_layers=num_layers,
-                                            num_timesteps=T, K=_tagconv_K)
+                                            num_timesteps=T, K=_tagconv_K,
+                                            cond_channels=_cond_ch)
             _dense_A = torch.tensor(build_dense_adjacency(Sigma_np, top_k=20),
                                     dtype=torch.float32)
         else:
             backbone = PortfolioScoreBackbone(d=N, hidden=hidden,
                                                 num_layers=num_layers,
-                                                num_timesteps=T, cond_channels=1)
+                                                num_timesteps=T, cond_channels=_cond_ch)
             _dense_A = None
-        score_net = ScoreNetWithLambda(backbone=backbone, expected_cond_feats=0)
+        score_net = ScoreNetWithLambda(backbone=backbone, expected_cond_feats=0,
+                                       lambda_channels=_lambda_ch)
         state = torch.load(ced_ckpt, map_location="cpu", weights_only=False)
         score_net.load_state_dict(state)
         score_net.to(device).eval()
         trained_score_fn = _make_trained_score_estimator(
-            score_net, _mk_sampler(ib, dual_step).alphas_cumprod, dense_A=_dense_A)
+            score_net, _mk_sampler(ib, dual_step).alphas_cumprod, dense_A=_dense_A,
+            constraint_type=constraint_type, num_sectors=pcfg.get("num_sectors", 10),
+            use_log1p=use_log1p_lambda, split_sector=_split_sector)
 
         # CED (ours) = trained net + dual ascent
         torch.manual_seed(seed)
@@ -636,6 +694,7 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             s_pdm_net._estimate_score = _types_net.MethodType(trained_score_fn, s_pdm_net)
             z_pdm_net = _pdm_sample(s_pdm_net, shape, device, data,
                                      Sigma, budgets, constraint_type,
+                                     extra=_extra_constraints if constraint_type == "enriched" else None,
                                      pdm_proj_lr=pdm_proj_lr)
             weights["pdm_net"] = s_pdm_net.z_to_portfolio_weights(z_pdm_net).detach()
 
@@ -646,13 +705,20 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
             s_d._estimate_score = _types_net.MethodType(trained_score_fn, s_d)
             _ac_d = s_d.alphas_cumprod
             _s_d = scale
-            _bud_d = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
+            if constraint_type == "enriched":
+                _dps_d_scales = torch.tensor(_extra_constraints["constraint_scales"], dtype=torch.float32, device=device)
+                _bud_d = torch.tensor(bud_np * _extra_constraints["constraint_scales"], dtype=torch.float32, device=device)
+            else:
+                _dps_d_scales = None
+                _bud_d = torch.tensor(bud_scaled, dtype=torch.float32, device=device)
             _cs_d = _constraint_scale
+            _ext_dps_d = _extra_constraints if constraint_type == "enriched" else None
             def _dps_correct_d(self, x_t, t, x0_pred, eps_pred,
                                _s=_s_d, _sc=scenarios, _b=_bud_d,
                                _a=float(alpha_np), _n=N, _sig=Sigma,
                                _ctype=constraint_type, _ac=_ac_d,
-                               _cscale=_cs_d):
+                               _cscale=_cs_d, _ext=_ext_dps_d,
+                               _dscales=_dps_d_scales):
                 B_loc = x_t.shape[0]
                 x_t_g = x_t.detach().requires_grad_(True)
                 alpha_bar = _ac[t].view(-1, 1, 1, 1)
@@ -660,7 +726,9 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                 sqrt_1mab = torch.sqrt((1.0 - alpha_bar).clamp_min(1e-12))
                 x0_tw = (x_t_g - sqrt_1mab * eps_pred.detach()) / sqrt_ab
                 w_g = torch.softmax(x0_tw[:, 0, :, 0], dim=-1)
-                if _ctype == "shortfall":
+                if _ctype == "enriched":
+                    c_g = bl._compute_constraints(w_g, _sig, _sc, _a, "enriched", extra=_ext)
+                elif _ctype == "shortfall":
                     c_g = shortfall_contributions_torch(w_g, _sc, _a)
                 elif _ctype == "variance_band":
                     c_var = variance_contributions_torch(w_g, _sig) * _cscale
@@ -671,6 +739,10 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
                     c_g = torch.cat([c_var, c_short], dim=-1)
                 else:
                     c_g = variance_contributions_torch(w_g, _sig) * _cscale
+                if _dscales is not None:
+                    c_g = c_g * _dscales.unsqueeze(0)
+                elif _cscale != 1.0:
+                    c_g = c_g * _cscale
                 loss = ((c_g - _b.unsqueeze(0)).clamp_min(0.0) ** 2).sum()
                 grad_xt = torch.autograd.grad(loss, x_t_g)[0]
                 x_t_corrected = (x_t - _s * grad_xt).detach()
@@ -742,6 +814,17 @@ def collect_all_weights(size: str, ib: float, dual_step: float, T: int,
     }
     if _extra_constraints:
         problem["extra"] = _extra_constraints
+    for k, v in weights.items():
+        if isinstance(v, torch.Tensor) and v.is_cuda:
+            weights[k] = v.cpu()
+    for k, v in lambda_traces.items():
+        if isinstance(v, torch.Tensor) and v.is_cuda:
+            lambda_traces[k] = v.cpu()
+    del mu, Sigma, scenarios, budgets
+    if 'score_net' in dir():
+        del score_net
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
     return {
         "weights": weights,
         "problem": problem,
@@ -810,7 +893,8 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
                             tagconv_K: int = 2,
                             dps_scale: float = 1.0,
                             dps_sweep: str = None,
-                            pdm_proj_lr: float = 0.1) -> list:
+                            pdm_proj_lr: float = 0.1,
+                            use_log1p_lambda: bool = True) -> list:
     """Collect weights for K instances."""
     pcfg = dict(PROBLEM_CONFIGS[size])
     N = pcfg["N"]
@@ -834,6 +918,7 @@ def collect_multi_instance(size: str, num_instances: int, ib: float,
             backbone=backbone, tagconv_K=tagconv_K,
             dps_scale=dps_scale, dps_sweep=dps_sweep,
             pdm_proj_lr=pdm_proj_lr,
+            use_log1p_lambda=use_log1p_lambda,
         )
         d["problem_seed"] = s
         data_list.append(d)
@@ -871,13 +956,17 @@ def _compute_contributions_np(w, problem):
             exposure[:, s] = w[:, sector_ids == s].sum(axis=1)
         upper_res = exposure - extra["sector_upper"][None, :]
         lower_res = extra["sector_lower"][None, :] - exposure
-        stress_port = w @ extra["stress_returns"].T
-        excess_loss = np.maximum(-stress_port - extra["stress_limits"][None, :], 0.0)
-        stress_res = excess_loss - extra["stress_eps"][None, :]
+        parts = [c_var, upper_res, lower_res]
+        if "stress_returns" in extra:
+            stress_port = w @ extra["stress_returns"].T
+            excess_loss = np.maximum(-stress_port - extra["stress_limits"][None, :], 0.0)
+            stress_res = excess_loss - extra["stress_eps"][None, :]
+            parts.append(stress_res)
         ent = -(w * np.log(np.clip(w, 1e-12, None))).sum(axis=1, keepdims=True)
         neff_val = np.exp(ent)
         neff_res = neff_val - extra.get("neff_target", 500.0)
-        return np.concatenate([c_var, upper_res, lower_res, stress_res, neff_res], axis=-1)
+        parts.append(neff_res)
+        return np.concatenate(parts, axis=-1)
     else:
         raise ValueError(f"Unknown constraint_type: {ct}")
 
@@ -929,7 +1018,8 @@ def _per_instance_metrics(weights_dict, problem, methods, eps_feas=0.1):
             extra = problem["extra"]
             n_var = N
             S = len(extra["sector_upper"])
-            M = len(extra["stress_limits"])
+            has_stress = "stress_limits" in extra
+            M = len(extra["stress_limits"]) if has_stress else 0
             var_c_mean = c_mean[:n_var]
             var_bud = bud[:n_var]
             metrics[m]["var_csat"] = float((var_c_mean <= var_bud + 1e-8).mean())
@@ -942,15 +1032,17 @@ def _per_instance_metrics(weights_dict, problem, methods, eps_feas=0.1):
             metrics[m]["sector_vio"] = float(np.maximum(sec_c_mean - sec_bud, 0.0).mean())
             sec_scale = max(abs(extra["sector_upper"]).mean(), 1e-12)
             metrics[m]["sector_rvio"] = float(np.maximum(sec_c_mean - sec_bud, 0.0).mean() / sec_scale)
-            str_end = n_var + 2 * S + M
-            str_c_mean = c_mean[n_var + 2 * S:str_end]
-            str_bud = bud[n_var + 2 * S:str_end]
-            metrics[m]["stress_csat"] = float((str_c_mean <= str_bud + 1e-8).mean())
-            metrics[m]["stress_vio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean())
-            str_scale = max(abs(extra["stress_eps"]).mean(), 1e-12)
-            metrics[m]["stress_rvio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean() / str_scale)
-            neff_c_mean = c_mean[str_end:]
-            neff_bud = bud[str_end:]
+            if has_stress:
+                str_end = n_var + 2 * S + M
+                str_c_mean = c_mean[n_var + 2 * S:str_end]
+                str_bud = bud[n_var + 2 * S:str_end]
+                metrics[m]["stress_csat"] = float((str_c_mean <= str_bud + 1e-8).mean())
+                metrics[m]["stress_vio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean())
+                str_scale = max(abs(extra["stress_eps"]).mean(), 1e-12)
+                metrics[m]["stress_rvio"] = float(np.maximum(str_c_mean - str_bud, 0.0).mean() / str_scale)
+            neff_start = n_var + 2 * S + M
+            neff_c_mean = c_mean[neff_start:]
+            neff_bud = bud[neff_start:]
             metrics[m]["neff_csat"] = float((neff_c_mean <= neff_bud + 1e-8).all())
             neff_target = extra.get("neff_target", 60.0)
             metrics[m]["neff_vio"] = float(np.maximum(neff_c_mean - neff_bud, 0.0).mean())
@@ -1039,17 +1131,18 @@ def plot_comparison_bars(data, out_dir, methods=PAPER_METHODS, eps_feas=0.1):
     is_enriched = data_list[0]["problem"].get("constraint_type") == "enriched"
 
     if is_enriched:
+        has_stress = "stress_limits" in data_list[0]["problem"].get("extra", {})
         var_csat = _stack("var_csat")
         sector_csat = _stack("sector_csat")
-        stress_csat = _stack("stress_csat")
+        stress_csat = _stack("stress_csat") if has_stress else None
         neff_csat_vals = _stack("neff_csat")
         var_vio = _stack("var_vio")
         sector_vio = _stack("sector_vio")
-        stress_vio = _stack("stress_vio")
+        stress_vio = _stack("stress_vio") if has_stress else None
         neff_vio_vals = _stack("neff_vio")
         var_rvio = _stack("var_rvio")
         sector_rvio = _stack("sector_rvio")
-        stress_rvio = _stack("stress_rvio")
+        stress_rvio = _stack("stress_rvio") if has_stress else None
         neff_rvio = _stack("neff_rvio")
 
     # Write LaTeX table
@@ -1058,16 +1151,19 @@ def plot_comparison_bars(data, out_dir, methods=PAPER_METHODS, eps_feas=0.1):
     def _enriched_table(use_rvio=False):
         tag = "rvio" if use_rvio else "baselines"
         vio_label = "RVio" if use_rvio else "Vio"
+        str_hdr = r" & Str\% " if has_stress else ""
+        str_vio_hdr = (r" & Str " + vio_label) if has_stress else ""
+        n_cols = 14 if has_stress else 12
         lines_e = [
             r"\begin{table}[t]",
             r"\centering",
             r"\caption{Enriched portfolio baseline comparison ($N=" + str(N) + r"$)}",
             r"\label{tab:portfolio_enriched_" + tag + r"}",
             r"\resizebox{\textwidth}{!}{%",
-            r"\begin{tabular}{l c c c c c c c c c c c c c c}",
+            r"\begin{tabular}{l" + " c" * n_cols + r"}",
             r"\toprule",
-            r"Method & Return & Var\% & Sec\% & Str\% & Neff\% & Feas\%"
-            r" & Var " + vio_label + r" & Sec " + vio_label + r" & Str " + vio_label + r" & Neff " + vio_label
+            r"Method & Return & Var\% & Sec\%" + str_hdr + r" & Neff\% & Feas\%"
+            r" & Var " + vio_label + r" & Sec " + vio_label + str_vio_hdr + r" & Neff " + vio_label
             + r" & $N_{\mathrm{eff}}$ & Entropy & $|\mathrm{top1}|$ \\",
             r"\midrule",
         ]
@@ -1080,41 +1176,45 @@ def plot_comparison_bars(data, out_dir, methods=PAPER_METHODS, eps_feas=0.1):
             td_m, td_s = float(top1_distinct[m].mean()), float(top1_distinct[m].std())
             vc_m, vc_s = float(var_csat[m].mean()), float(var_csat[m].std())
             sc_m, sc_s = float(sector_csat[m].mean()), float(sector_csat[m].std())
-            st_m, st_s = float(stress_csat[m].mean()), float(stress_csat[m].std())
+            st_m, st_s = (float(stress_csat[m].mean()), float(stress_csat[m].std())) if has_stress else (0, 0)
             nc_m, nc_s = float(neff_csat_vals[m].mean()), float(neff_csat_vals[m].std())
             if use_rvio:
                 v1_m, v1_s = float(var_rvio[m].mean()), float(var_rvio[m].std())
                 v2_m, v2_s = float(sector_rvio[m].mean()), float(sector_rvio[m].std())
-                v3_m, v3_s = float(stress_rvio[m].mean()), float(stress_rvio[m].std())
+                v3_m, v3_s = (float(stress_rvio[m].mean()), float(stress_rvio[m].std())) if has_stress else (0, 0)
                 v4_m, v4_s = float(neff_rvio[m].mean()), float(neff_rvio[m].std())
                 vfmt = lambda vm, vs: f"{vm:.3f}$\\pm${vs:.3f}" if show_std else f"{vm:.3f}"
             else:
                 v1_m, v1_s = float(var_vio[m].mean()), float(var_vio[m].std())
                 v2_m, v2_s = float(sector_vio[m].mean()), float(sector_vio[m].std())
-                v3_m, v3_s = float(stress_vio[m].mean()), float(stress_vio[m].std())
+                v3_m, v3_s = (float(stress_vio[m].mean()), float(stress_vio[m].std())) if has_stress else (0, 0)
                 v4_m, v4_s = float(neff_vio_vals[m].mean()), float(neff_vio_vals[m].std())
                 vfmt = lambda vm, vs: f"{vm:.2e}$\\pm${vs:.2e}" if show_std else f"{vm:.2e}"
+            str_csat_cell = f" & {st_m:.2f}$\\pm${st_s:.2f}" if has_stress else ""
+            str_vio_cell = f" & {vfmt(v3_m, v3_s)}" if has_stress else ""
             if show_std:
                 lines_e.append(
                     f"  {lbl} & {r_m:.3f}$\\pm${r_s:.3f}"
                     f" & {vc_m:.2f}$\\pm${vc_s:.2f}"
                     f" & {sc_m:.2f}$\\pm${sc_s:.2f}"
-                    f" & {st_m:.2f}$\\pm${st_s:.2f}"
+                    + str_csat_cell +
                     f" & {nc_m:.2f}$\\pm${nc_s:.2f}"
                     f" & {f_m:.2f}$\\pm${f_s:.2f}"
                     f" & {vfmt(v1_m, v1_s)}"
                     f" & {vfmt(v2_m, v2_s)}"
-                    f" & {vfmt(v3_m, v3_s)}"
+                    + str_vio_cell +
                     f" & {vfmt(v4_m, v4_s)}"
                     f" & {ne_m:.1f}$\\pm${ne_s:.1f}"
                     f" & {h_m:.2f}$\\pm${h_s:.2f}"
                     f" & {td_m:.0f}$\\pm${td_s:.0f} \\\\")
             else:
+                str_c_ns = f" & {st_m:.2f}" if has_stress else ""
+                str_v_ns = f" & {vfmt(v3_m, v3_s)}" if has_stress else ""
                 lines_e.append(
                     f"  {lbl} & {r_m:.3f}"
-                    f" & {vc_m:.2f} & {sc_m:.2f} & {st_m:.2f} & {nc_m:.2f} & {f_m:.2f}"
+                    f" & {vc_m:.2f} & {sc_m:.2f}" + str_c_ns + f" & {nc_m:.2f} & {f_m:.2f}"
                     f" & {vfmt(v1_m, v1_s)} & {vfmt(v2_m, v2_s)}"
-                    f" & {vfmt(v3_m, v3_s)} & {vfmt(v4_m, v4_s)}"
+                    + str_v_ns + f" & {vfmt(v4_m, v4_s)}"
                     f" & {ne_m:.1f} & {h_m:.2f} & {td_m:.0f} \\\\")
         lines_e += [r"\bottomrule", r"\end{tabular}}", r"\end{table}"]
         return lines_e
@@ -2499,29 +2599,44 @@ def trace_extra_figures(data_list, out_dir, args, device, n_lam_instances=5):
         ).to(device)
 
         _use_gnn = args.backbone == "gnn"
+        _lambda_ch_tr = (3 if pcfg0.get("skip_stress") else 4) if ct0 == "enriched" else 1
+        _split_sector_tr = False
+        if _use_gnn:
+            _probe_tr = torch.load(args.ced_ckpt, map_location="cpu", weights_only=False)
+            _ipw_tr = _probe_tr.get("backbone.input_proj.weight")
+            if _ipw_tr is not None:
+                _lambda_ch_tr = int(_ipw_tr.shape[1]) - 1
+                _legacy_tr = 3 if pcfg0.get("skip_stress") else 4
+                _split_sector_tr = (ct0 == "enriched" and _lambda_ch_tr == _legacy_tr + 1)
+            del _probe_tr
+        _cond_ch_tr = _lambda_ch_tr
         if _use_gnn:
             from pdi.models.portfolio_gnn_backbone import (
                 PortfolioGNNBackbone, build_dense_adjacency,
             )
             bb = PortfolioGNNBackbone(d=N0, hidden=args.hidden,
                                        num_layers=args.num_layers,
-                                       num_timesteps=args.T, K=args.tagconv_K)
+                                       num_timesteps=args.T, K=args.tagconv_K,
+                                       cond_channels=_cond_ch_tr)
             Sigma_np0 = problem0["Sigma"]
             _dense_A = torch.tensor(build_dense_adjacency(Sigma_np0, top_k=20),
                                      dtype=torch.float32)
         else:
             bb = PortfolioScoreBackbone(d=N0, hidden=args.hidden,
                                          num_layers=args.num_layers,
-                                         num_timesteps=args.T, cond_channels=1)
+                                         num_timesteps=args.T, cond_channels=_cond_ch_tr)
             _dense_A = None
 
-        score_net_tr = ScoreNetWithLambda(backbone=bb, expected_cond_feats=0)
+        score_net_tr = ScoreNetWithLambda(backbone=bb, expected_cond_feats=0,
+                                          lambda_channels=_lambda_ch_tr)
         ckpt = torch.load(args.ced_ckpt, map_location=device)
         score_net_tr.load_state_dict(ckpt)
         score_net_tr.to(device).eval()
 
         _tr_score_fn = _make_trained_score_estimator(
-            score_net_tr, sampler_tr.alphas_cumprod, dense_A=_dense_A)
+            score_net_tr, sampler_tr.alphas_cumprod, dense_A=_dense_A,
+            constraint_type=ct0, num_sectors=pcfg0.get("num_sectors", 10),
+            use_log1p=not args.no_log1p_lambda, split_sector=_split_sector_tr)
         sampler_tr._estimate_score = _types_tr.MethodType(_tr_score_fn, sampler_tr)
 
         data_tr = _make_batch(args.B, N0).to(device)
@@ -2651,6 +2766,10 @@ def main():
                         help="Override constraint type (e.g. 'enriched').")
     parser.add_argument("--sector-gamma", type=float, default=1.5,
                         help="Sector exposure tightness for enriched constraints.")
+    parser.add_argument("--skip-stress", action="store_true", default=False,
+                        help="Enriched without stress constraints.")
+    parser.add_argument("--no-log1p-lambda", action="store_true", default=False,
+                        help="Disable log1p normalization of lambda conditioning.")
     args = parser.parse_args()
 
     if args.gamma is not None:
@@ -2661,6 +2780,8 @@ def main():
         PROBLEM_CONFIGS[args.size]["constraint_type"] = args.constraint_type
     if args.constraint_type == "enriched":
         PROBLEM_CONFIGS[args.size]["sector_gamma"] = args.sector_gamma
+        if args.skip_stress:
+            PROBLEM_CONFIGS[args.size]["skip_stress"] = True
 
     # Auto-detect architecture params from checkpoint's summary.json
     if args.ced_ckpt is not None:
@@ -2902,6 +3023,7 @@ def main():
                 mc_lambda_study=args.mc_lambda_study,
                 dps_scale=args.dps_scale, dps_sweep=args.dps_sweep,
                 pdm_proj_lr=args.pdm_proj_lr,
+                use_log1p_lambda=not args.no_log1p_lambda,
             )
             data_list = [data]
         else:
@@ -2922,6 +3044,7 @@ def main():
                 dps_scale=args.dps_scale, dps_sweep=args.dps_sweep,
                 backbone=args.backbone, tagconv_K=args.tagconv_K,
                 pdm_proj_lr=args.pdm_proj_lr,
+                use_log1p_lambda=not args.no_log1p_lambda,
             )
         _save_cache(cache_path, data_list)
         print(f"Saved weights cache to {cache_path}")

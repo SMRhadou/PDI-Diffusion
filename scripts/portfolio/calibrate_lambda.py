@@ -36,7 +36,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from pdi.diffusion.portfolio_energy_ddpm import (  # noqa: E402
-    PortfolioEnergyDDPM, make_portfolio_problem,
+    PortfolioEnergyDDPM, make_portfolio_problem, make_enriched_portfolio_problem,
     variance_contributions_np,
 )
 
@@ -75,7 +75,8 @@ def run_and_record_lambda(ib: float, dual_step: float, mu, Sigma, scenarios, bud
                            constraint_type: str = "shortfall",
                            num_sectors: int = 10,
                            objective_scale: float = 1.0,
-                           constraint_scale: float = 1.0) -> dict:
+                           constraint_scale: float = 1.0,
+                           extra_constraints: dict = None) -> dict:
     """Run the MC reverse pass and record lambda at every timestep."""
     torch.manual_seed(seed)
     if constraint_type in ("variance", "variance_band", "variance_sector"):
@@ -101,6 +102,7 @@ def run_and_record_lambda(ib: float, dual_step: float, mu, Sigma, scenarios, bud
         num_sectors=num_sectors,
         objective_scale=objective_scale,
         constraint_scale=constraint_scale,
+        extra_constraints=extra_constraints or {},
     ).to(device)
 
     data = _make_batch(B, N).to(device)
@@ -219,6 +221,10 @@ def main():
     parser.add_argument("--no-normalize", action="store_true", default=False)
     parser.add_argument("--dual-lambda-decay", type=float, default=0.0)
     parser.add_argument("--lam0", type=float, default=0.0)
+    parser.add_argument("--constraint-type", type=str, default=None,
+                        help="Override constraint type from config")
+    parser.add_argument("--sector-gamma", type=float, default=1.5)
+    parser.add_argument("--skip-stress", action="store_true", default=False)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,17 +233,26 @@ def main():
     pcfg = dict(PROBLEM_CONFIGS[args.size])
     N = pcfg["N"]
     constraint_type = pcfg.pop("constraint_type", "shortfall")
-    mu, Sigma, scenarios, budgets, alpha = make_portfolio_problem(
-        constraint_type=constraint_type, **pcfg)
-
-    if constraint_type in ("variance", "variance_band", "variance_sector"):
-        _c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma).mean()
+    if args.constraint_type is not None:
+        constraint_type = args.constraint_type
+    _extra_constraints = {}
+    if constraint_type == "enriched":
+        mu, Sigma, scenarios, budgets, alpha, _extra_constraints = \
+            make_enriched_portfolio_problem(sector_gamma=args.sector_gamma, skip_stress=args.skip_stress, **pcfg)
         _ret_mean = abs(scenarios.mean(axis=0)).mean()
         _obj_scale = 1.0 / max(_ret_mean, 1e-12)
-        _constraint_scale = 1.0 / max(_c_eq_mean, 1e-12)
-    else:
-        _obj_scale = 1.0
         _constraint_scale = 1.0
+    else:
+        mu, Sigma, scenarios, budgets, alpha = make_portfolio_problem(
+            constraint_type=constraint_type, **pcfg)
+        if constraint_type in ("variance", "variance_band", "variance_sector"):
+            _c_eq_mean = variance_contributions_np(np.ones(N) / N, Sigma).mean()
+            _ret_mean = abs(scenarios.mean(axis=0)).mean()
+            _obj_scale = 1.0 / max(_ret_mean, 1e-12)
+            _constraint_scale = 1.0 / max(_c_eq_mean, 1e-12)
+        else:
+            _obj_scale = 1.0
+            _constraint_scale = 1.0
 
     print(f"[calibrate] size={args.size} N={N} ib={args.ib} ds={args.dual_step} T={args.T} B={args.B}")
     print(f"  constraint_type={constraint_type} normalize={not args.no_normalize}")
@@ -259,6 +274,7 @@ def main():
         num_sectors=pcfg.get("num_sectors", 10),
         objective_scale=_obj_scale,
         constraint_scale=_constraint_scale,
+        extra_constraints=_extra_constraints,
     )
     wall = time.time() - t0
 

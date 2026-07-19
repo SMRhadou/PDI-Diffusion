@@ -345,6 +345,7 @@ def make_enriched_portfolio_problem(
     structure: str = "sectors",
     num_sectors: int = 10,
     budget_type: str = "uniform",
+    skip_stress: bool = False,
     **kwargs,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, dict]:
     """Generate portfolio problem with variance + sector + stress constraints.
@@ -373,39 +374,46 @@ def make_enriched_portfolio_problem(
     sector_budgets = np.zeros(2 * S)
 
     # --- Stress-loss constraints ---
-    n_high_risk = kwargs.get("n_high_risk_sectors", 2)
-    rng_stress = np.random.RandomState(seed)
-    high_risk_sectors = set(rng_stress.choice(S, size=n_high_risk, replace=False))
-    stress_returns, loss_limits, stress_eps = _generate_stress_scenarios(
-        N, sector_ids, S, high_risk_sectors, Sigma,
-        np.random.RandomState(seed + 1000),
-    )
-    stress_budgets = np.zeros(len(loss_limits))
-
-    # Neff (cardinality) constraint: Neff(x) <= neff_target
     neff_target = kwargs.get("neff_target", 60.0)
-    neff_budget = np.zeros(1)  # residual is Neff(x) - target <= 0
+    neff_budget = np.zeros(1)
 
-    budgets = np.concatenate([var_budgets, sector_budgets, stress_budgets, neff_budget])
-
-    # Per-constraint normalization scales so all violations are O(1).
-    c_eq_var = (x_eq * (Sigma @ x_eq))  # [N] variance contributions at equal weight
+    c_eq_var = (x_eq * (Sigma @ x_eq))
     var_scale = np.full(N, 1.0 / max(c_eq_var.mean(), 1e-12))
     sector_scale = np.full(2 * S, 1.0 / max(x_eq_sector.mean(), 1e-12))
-    stress_scale = np.full(len(loss_limits), 1.0 / max(stress_eps.mean(), 1e-12))
     neff_scale = np.full(1, 1.0 / N)
-    constraint_scales = np.concatenate([var_scale, sector_scale, stress_scale, neff_scale])
 
-    extra = dict(
-        sector_ids=sector_ids,
-        sector_upper=sector_upper,
-        sector_lower=sector_lower,
-        stress_returns=stress_returns,
-        stress_limits=loss_limits,
-        stress_eps=stress_eps,
-        neff_target=neff_target,
-        constraint_scales=constraint_scales,
-    )
+    if skip_stress:
+        budgets = np.concatenate([var_budgets, sector_budgets, neff_budget])
+        constraint_scales = np.concatenate([var_scale, sector_scale, neff_scale])
+        extra = dict(
+            sector_ids=sector_ids,
+            sector_upper=sector_upper,
+            sector_lower=sector_lower,
+            neff_target=neff_target,
+            constraint_scales=constraint_scales,
+        )
+    else:
+        n_high_risk = kwargs.get("n_high_risk_sectors", 2)
+        rng_stress = np.random.RandomState(seed)
+        high_risk_sectors = set(rng_stress.choice(S, size=n_high_risk, replace=False))
+        stress_returns, loss_limits, stress_eps = _generate_stress_scenarios(
+            N, sector_ids, S, high_risk_sectors, Sigma,
+            np.random.RandomState(seed + 1000),
+        )
+        stress_budgets = np.zeros(len(loss_limits))
+        stress_scale = np.full(len(loss_limits), 1.0 / max(stress_eps.mean(), 1e-12))
+        budgets = np.concatenate([var_budgets, sector_budgets, stress_budgets, neff_budget])
+        constraint_scales = np.concatenate([var_scale, sector_scale, stress_scale, neff_scale])
+        extra = dict(
+            sector_ids=sector_ids,
+            sector_upper=sector_upper,
+            sector_lower=sector_lower,
+            stress_returns=stress_returns,
+            stress_limits=loss_limits,
+            stress_eps=stress_eps,
+            neff_target=neff_target,
+            constraint_scales=constraint_scales,
+        )
     return mu, Sigma, scenarios, budgets, alpha, extra
 
 
@@ -613,6 +621,27 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             **ctx_kwargs,
         )
 
+    @staticmethod
+    def _tile_context(context, K: int):
+        from dataclasses import fields
+        B = context.r_min.shape[0] if hasattr(context, "r_min") else None
+        _non_batch = {"sector_ids", "sector_upper", "sector_lower",
+                      "stress_returns", "stress_limits", "stress_eps",
+                      "constraint_scales"}
+        updates = {}
+        for f in fields(context):
+            if f.name in _non_batch:
+                continue
+            v = getattr(context, f.name)
+            if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.shape[0] > 1:
+                if B is not None and v.shape[0] != B:
+                    continue
+                updates[f.name] = v.repeat(K, *([1] * (v.dim() - 1)))
+        if not updates:
+            return context
+        from dataclasses import replace
+        return replace(context, **updates)
+
     def _init_dual_lambda(self, batch_size, num_nodes, *, device, dtype, init_value):
         n_constraints = len(self._port_risk_budgets)
         return torch.full((batch_size, n_constraints), float(init_value),
@@ -731,16 +760,19 @@ class PortfolioEnergyDDPM(EnergyDDPM):
             exposure.scatter_add_(1, sid.unsqueeze(0).expand(B_sz, -1), weights)
             upper_res = exposure - context.sector_upper.unsqueeze(0)
             lower_res = context.sector_lower.unsqueeze(0) - exposure
-            stress_port_ret = torch.matmul(weights, context.stress_returns.t())
-            excess_loss = torch.clamp(
-                -stress_port_ret - context.stress_limits.unsqueeze(0), min=0.0,
-            )
-            stress_res = excess_loss - context.stress_eps.unsqueeze(0)
-            # Neff constraint: Neff(x) - target <= 0
+            parts = [c_var, upper_res, lower_res]
+            if context.stress_returns is not None and context.stress_returns.numel() > 0:
+                stress_port_ret = torch.matmul(weights, context.stress_returns.t())
+                excess_loss = torch.clamp(
+                    -stress_port_ret - context.stress_limits.unsqueeze(0), min=0.0,
+                )
+                stress_res = excess_loss - context.stress_eps.unsqueeze(0)
+                parts.append(stress_res)
             ent = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=1, keepdim=True)
-            neff_val = torch.exp(ent)  # [B, 1]
-            neff_res = neff_val - context.neff_target  # [B, 1]
-            c = torch.cat([c_var, upper_res, lower_res, stress_res, neff_res], dim=1)
+            neff_val = torch.exp(ent)
+            neff_res = neff_val - context.neff_target
+            parts.append(neff_res)
+            c = torch.cat(parts, dim=1)
             if context.constraint_scales is not None:
                 c = c * context.constraint_scales.unsqueeze(0)
         else:
