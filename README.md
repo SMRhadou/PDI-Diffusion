@@ -1,6 +1,6 @@
 # Constrained Diffusion Model with Primal-Dual Inference
 
-Code for [constrained diffusion models using primal-dual inference](https://arxiv.org/pdf/2606.17192) (PDI). The method integrates Lagrangian dual variables into diffusion-based generative models to enforce average constraints during sampling. 
+Code for [constrained diffusion models using primal-dual inference] (PDI). The method integrates Lagrangian dual variables into diffusion-based generative models to enforce average constraints during sampling. 
 
 ## Applications
 
