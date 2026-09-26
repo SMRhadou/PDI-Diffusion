@@ -4,7 +4,7 @@ Code for [constrained diffusion models using primal-dual inference](https://arxi
 
 ## Applications
 
-- **Wireless Resource Allocation (WRA):** Power allocation in wireless networks subject to minimum-rate constraints (based on our other [repo](https://github.com/yigit-uslu/Graph-Signal-Generative-Diffusion-Modeling))
+- **Wireless Resource Allocation (WRA):** Power allocation in wireless networks subject to minimum-rate constraints 
 - **Portfolio Optimization:** Constrained portfolio management
 - **Synthetic Experiments:** Constrained sampling from mixture of Gaussians
 
@@ -101,13 +101,3 @@ bash scripts/portfolio/train.sh
 bash scripts/portfolio/eval.sh "outputs/portfolio/score_net_train/2026-06-30_15-31-38 - crypto_ib2000_ds300_mumax1500_rho0.7_v13_K1_cosine/score_net_best_pareto.pt" old_config
 ```
 
-## Citation
-
-```bibtex
-@article{pdi_diffusion_2026,
-  title={Constrained Diffusion Models with Primal-Dual Inference},
-  author={Hadou, Samar and Uslu, Yigit Berkay and Ribeiro, Alejandro},
-  year={2026},
-  url={https://arxiv.org/pdf/2606.17192}
-}
-```
